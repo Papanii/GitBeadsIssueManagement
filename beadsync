@@ -1,0 +1,1043 @@
+#!/usr/bin/env bash
+# =============================================================================
+# beadsync — Speckit → Beads → GitHub Issues workflow bridge
+# Version  : 1.0.0
+# Requires : bash ≥ 4.3, jq, gh (GitHub CLI)
+# =============================================================================
+# SOURCE OF TRUTH MODEL
+#   Phase 1 — Speckit is canonical.  Run: speckit-to-beads
+#   Phase 2 — Beads are canonical.   Run: beads-to-gh / sync
+#   GitHub Issues are read-only projections of Beads.
+#   GitHub edits do NOT flow back into Beads unless --force is used.
+# =============================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Colours (disabled when not a TTY)
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+  BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+else
+  RED=''; YELLOW=''; GREEN=''; BLUE=''; CYAN=''; BOLD=''; RESET=''
+fi
+
+# ---------------------------------------------------------------------------
+# Global flags
+# ---------------------------------------------------------------------------
+DRY_RUN=false
+VERBOSE=false
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+log_info()  { printf "${GREEN}[INFO]${RESET}  %s\n"  "$*"; }
+log_warn()  { printf "${YELLOW}[WARN]${RESET}  %s\n"  "$*" >&2; }
+log_error() { printf "${RED}[ERROR]${RESET} %s\n"  "$*" >&2; }
+log_debug() { [[ "$VERBOSE" == true ]] && printf "${CYAN}[DEBUG]${RESET} %s\n" "$*" || true; }
+log_dry()   { printf "${BLUE}[DRY]${RESET}   %s\n"  "$*"; }
+
+die()       { log_error "$*"; exit 1; }
+die_usage() { log_error "$*"; exit 2; }
+
+# =============================================================================
+# DEPENDENCY CHECKS
+# =============================================================================
+
+check_core_deps() {
+  local missing=()
+  command -v jq      &>/dev/null || missing+=("jq  (brew install jq)")
+  # macOS ships shasum; Linux ships sha256sum
+  { command -v sha256sum &>/dev/null || command -v shasum &>/dev/null; } \
+    || missing+=("sha256sum / shasum")
+  [[ ${#missing[@]} -eq 0 ]] || die "Missing dependencies: ${missing[*]}"
+}
+
+check_gh_dep() {
+  command -v gh &>/dev/null || die "gh (GitHub CLI) required.  Install: brew install gh"
+  if ! gh auth status &>/dev/null 2>&1; then
+    die "gh is not authenticated.  Run: gh auth login"
+  fi
+}
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+# Portable SHA-256 → hex string of any stdin
+_sha256() { command -v sha256sum &>/dev/null && sha256sum | awk '{print $1}' \
+              || shasum -a 256 | awk '{print $1}'; }
+
+sha256_of() { printf '%s' "$1" | _sha256; }
+
+iso8601_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+require_dir() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would create: $dir"; return; }
+    mkdir -p "$dir"
+    log_debug "Created directory: $dir"
+  fi
+}
+
+require_file() { [[ -f "$1" ]] || die "File not found: $1"; }
+
+validate_json_file() {
+  jq empty "$1" 2>/dev/null || die "Invalid JSON in file: $1"
+}
+
+# Sanitise a Speckit ID into a safe filename component
+safe_filename_part() {
+  printf '%s' "$1" | tr '/\\:*?"<>| \t' '-' | tr -s '-' | sed 's/^-//;s/-$//'
+}
+
+# =============================================================================
+# FIELD MAPPING: Speckit → Bead
+# =============================================================================
+
+# Portable lowercase (works with bash 3.2 shipped on macOS)
+lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Speckit priority string → Bead integer (P0–P4)
+map_priority() {
+  case "$(lc "$1")" in
+    critical|p0|0)          echo 0 ;;
+    high|p1|1)              echo 1 ;;
+    medium|normal|p2|2)     echo 2 ;;
+    low|p3|3)               echo 3 ;;
+    none|trivial|p4|4|*)    echo 4 ;;
+  esac
+}
+
+# Speckit status string → Bead status enum
+map_status() {
+  case "$(lc "$1")" in
+    pending|todo|backlog|open|new|not_started)           echo "open" ;;
+    in_progress|in-progress|active|started|wip|doing)   echo "in_progress" ;;
+    done|complete|completed|closed|resolved|finished)   echo "closed" ;;
+    blocked|on_hold|on-hold|waiting)                    echo "blocked" ;;
+    deferred|postponed|later|icebox)                    echo "deferred" ;;
+    cancelled|canceled|wontfix|wont_fix|abandoned)      echo "closed" ;;  # close_reason set separately
+    *)                                                  echo "open" ;;
+  esac
+}
+
+# Map status string to Bead close_reason when applicable
+map_close_reason() {
+  case "$(lc "$1")" in
+    cancelled|canceled|wontfix|wont_fix)   echo "wontfix" ;;
+    abandoned)                              echo "abandoned" ;;
+    done|complete|completed|resolved)       echo "completed" ;;
+    *)                                      echo "" ;;
+  esac
+}
+
+# Speckit type string → Bead issue_type enum
+map_type() {
+  case "$(lc "$1")" in
+    task|tasks|work)                       echo "task" ;;
+    bug|defect|issue|error)               echo "bug" ;;
+    feature|enhancement|feat|story|us)    echo "feature" ;;
+    epic|theme|initiative|program)        echo "epic" ;;
+    chore|maintenance|infra|tech_debt|dx) echo "chore" ;;
+    decision|adr|dec|rfc)                 echo "decision" ;;
+    *)                                    echo "task" ;;
+  esac
+}
+
+# =============================================================================
+# BEAD IDENTITY
+# =============================================================================
+
+# Stable external_id derived deterministically from project + task ID.
+# Format: "speckit-<project-id>-<task-id>"
+# This scopes identity to the project, preventing cross-project collisions
+# when multiple projects share the same Speckit task IDs (e.g. SPEC-001).
+# This is the canonical cross-system identity used to:
+#   • prevent duplicate Beads within a project
+#   • prevent duplicate GitHub issues
+#   • match Beads to GitHub issues
+compute_external_id() {
+  local project_id="$1"
+  local task_id="$2"
+  printf 'speckit-%s-%s' "$project_id" "$task_id"
+}
+
+# Human-readable, filesystem-safe bead filename (project-scoped)
+compute_bead_filename() {
+  local project_id="$1"
+  local task_id="$2"
+  local safe_project safe_task
+  safe_project=$(safe_filename_part "$project_id")
+  safe_task=$(safe_filename_part "$task_id")
+  printf 'bead-%s-%s.json' "$safe_project" "$safe_task"
+}
+
+# Content hash of key Bead fields (excludes sync-state metadata).
+# A change in this hash means the Bead needs to be pushed to GitHub.
+compute_content_hash() {
+  local bead_json="$1"
+  local canonical
+  canonical=$(printf '%s' "$bead_json" | jq -c '{
+    title, description, acceptance_criteria, notes,
+    status, priority, issue_type, assignee, labels, due_at
+  }')
+  sha256_of "$canonical"
+}
+
+# =============================================================================
+# SPECKIT → BEADS
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Speckit export JSON schema (assumed):
+# {
+#   "export_version": "1.0",        // optional
+#   "exported_at":    "<ISO8601>",   // optional
+#   "project": { "id": "...", "name": "..." },  // optional
+#   "tasks": [
+#     {
+#       "id":                   "<string>",   // REQUIRED — unique stable ID
+#       "title":                "<string>",   // REQUIRED
+#       "description":          "<string>",   // optional
+#       "acceptance_criteria":  "<string>",   // optional
+#       "notes":                "<string>",   // optional
+#       "priority":             "<string>",   // optional: critical|high|medium|low|none
+#       "status":               "<string>",   // optional: pending|in_progress|done|blocked|deferred|cancelled
+#       "type":                 "<string>",   // optional: task|bug|feature|epic|chore|decision
+#       "assignee":             "<string>",   // optional: GitHub username
+#       "labels":               ["<string>"], // optional
+#       "milestone":            "<string>",   // optional
+#       "estimated_hours":      <number>,     // optional
+#       "due_date":             "<YYYY-MM-DD>",// optional
+#       "parent_id":            "<string>",   // optional — Speckit ID of parent task
+#       "created_at":           "<ISO8601>",  // optional
+#       "updated_at":           "<ISO8601>"   // optional
+#     }
+#   ]
+# }
+# ---------------------------------------------------------------------------
+
+cmd_speckit_to_beads() {
+  local speckit_file=""
+  local out_dir="./beads"
+  local project_id_flag=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out|-o)       out_dir="$2";         shift 2 ;;
+      --project|-p)   project_id_flag="$2"; shift 2 ;;
+      --dry-run)      DRY_RUN=true;         shift ;;
+      --verbose|-v)   VERBOSE=true;         shift ;;
+      -*)             die "Unknown option: $1" ;;
+      *)
+        [[ -z "$speckit_file" ]] && speckit_file="$1"
+        shift ;;
+    esac
+  done
+
+  [[ -n "$speckit_file" ]] || die_usage "Usage: beadsync speckit-to-beads <speckit_export.json> [--out DIR] [--project ID]"
+  require_file "$speckit_file"
+  validate_json_file "$speckit_file"
+
+  # Validate that .tasks is an array
+  local tasks_type task_count
+  tasks_type=$(jq -r '.tasks | type' "$speckit_file" 2>/dev/null) \
+    || die "Invalid Speckit JSON: cannot parse file"
+  [[ "$tasks_type" == "array" ]] \
+    || die "Invalid Speckit JSON: '.tasks' must be an array (got: ${tasks_type:-missing})"
+  task_count=$(jq '.tasks | length' "$speckit_file")
+
+  # Resolve project ID: --project flag > export's project.id > export's project.name > filename stem
+  local project_id
+  if [[ -n "$project_id_flag" ]]; then
+    project_id="$project_id_flag"
+  else
+    project_id=$(jq -r '.project.id // .project.name // ""' "$speckit_file")
+    if [[ -z "$project_id" ]]; then
+      # Fall back to the filename without extension
+      project_id=$(basename "$speckit_file" .json)
+      log_warn "No project.id in export — using filename as project ID: $project_id"
+      log_warn "Use --project <id> to set an explicit project ID."
+    fi
+  fi
+
+  # Normalise: lowercase, collapse non-alphanumeric runs to single dash, trim edges
+  project_id=$(printf '%s' "$project_id" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -cs 'a-z0-9' '-' \
+    | sed 's/^-//;s/-$//')
+
+  log_info "Speckit export  : $speckit_file"
+  log_info "Project ID      : $project_id"
+  log_info "Output directory: $out_dir"
+  log_info "Tasks found     : $task_count"
+  [[ "$DRY_RUN" == true ]] && log_warn "Dry-run mode — no files will be written"
+
+  require_dir "$out_dir"
+
+  local created=0 updated=0 skipped=0 failed=0
+
+  while IFS= read -r task_json; do
+
+    # ---- Required fields ---------------------------------------------------
+    local speckit_id title
+    speckit_id=$(printf '%s' "$task_json" | jq -r '.id // empty')
+    if [[ -z "$speckit_id" ]]; then
+      log_warn "Skipping task with no 'id' field"
+      (( failed++ )); continue
+    fi
+
+    title=$(printf '%s' "$task_json" | jq -r '.title // empty')
+    if [[ -z "$title" ]]; then
+      log_warn "Skipping task $speckit_id: no 'title' field"
+      (( failed++ )); continue
+    fi
+
+    # ---- Derived identity --------------------------------------------------
+    local external_id bead_filename bead_path
+    external_id=$(compute_external_id "$project_id" "$speckit_id")
+    bead_filename=$(compute_bead_filename "$project_id" "$speckit_id")
+    bead_path="$out_dir/$bead_filename"
+
+    log_debug "Processing $speckit_id → $bead_filename"
+
+    # ---- Optional fields ---------------------------------------------------
+    local description acc_criteria notes assignee milestone
+    local estimated_hours due_date parent_id created_at updated_at raw_status
+    description=$(printf '%s' "$task_json" | jq -r '.description     // ""')
+    acc_criteria=$(printf '%s' "$task_json" | jq -r '.acceptance_criteria // ""')
+    notes=$(printf '%s'        "$task_json" | jq -r '.notes           // ""')
+    assignee=$(printf '%s'     "$task_json" | jq -r '.assignee        // ""')
+    milestone=$(printf '%s'    "$task_json" | jq -r '.milestone       // ""')
+    estimated_hours=$(printf '%s' "$task_json" | jq -r '.estimated_hours // 0')
+    due_date=$(printf '%s'     "$task_json" | jq -r '.due_date        // ""')
+    parent_id=$(printf '%s'    "$task_json" | jq -r '.parent_id       // ""')
+    created_at=$(printf '%s'   "$task_json" | jq -r '.created_at      // ""')
+    updated_at=$(printf '%s'   "$task_json" | jq -r '.updated_at      // ""')
+    raw_status=$(printf '%s'   "$task_json" | jq -r '.status          // "pending"')
+
+    local now
+    now=$(iso8601_now)
+    [[ -n "$created_at" ]] || created_at="$now"
+    [[ -n "$updated_at" ]] || updated_at="$now"
+
+    # ---- Mapped fields -----------------------------------------------------
+    local bead_status bead_priority bead_type close_reason
+    bead_status=$(map_status   "$(printf '%s' "$task_json" | jq -r '.status   // "pending"')")
+    bead_priority=$(map_priority "$(printf '%s' "$task_json" | jq -r '.priority // "medium"')")
+    bead_type=$(map_type       "$(printf '%s' "$task_json" | jq -r '.type     // "task"')")
+    close_reason=$(map_close_reason "$raw_status")
+
+    # estimated_minutes (integer arithmetic, avoid bc dependency)
+    local estimated_minutes=0
+    if [[ "$estimated_hours" != "0" && -n "$estimated_hours" ]]; then
+      # Strip decimals, multiply by 60
+      local eh_int
+      eh_int=$(printf '%.0f' "$estimated_hours" 2>/dev/null || printf '%s' "$estimated_hours" | cut -d. -f1)
+      estimated_minutes=$(( eh_int * 60 ))
+    fi
+
+    # due_at — append T00:00:00Z if only a date was provided
+    local due_at=""
+    if [[ -n "$due_date" ]]; then
+      [[ "$due_date" =~ T ]] && due_at="$due_date" || due_at="${due_date}T00:00:00Z"
+    fi
+
+    # Labels array
+    local labels_json
+    labels_json=$(printf '%s' "$task_json" | jq -c '.labels // []')
+
+    # ---- Build Bead JSON ---------------------------------------------------
+    local bead_json
+    bead_json=$(jq -n \
+      --arg  external_id        "$external_id" \
+      --arg  title               "$title" \
+      --arg  description         "$description" \
+      --arg  acceptance_criteria "$acc_criteria" \
+      --arg  notes               "$notes" \
+      --arg  spec_id             "$speckit_id" \
+      --arg  status              "$bead_status" \
+      --argjson priority         "$bead_priority" \
+      --arg  issue_type          "$bead_type" \
+      --arg  assignee            "$assignee" \
+      --argjson labels           "$labels_json" \
+      --arg  external_ref        "speckit-${speckit_id}" \
+      --arg  source_system       "speckit" \
+      --argjson estimated_minutes "$estimated_minutes" \
+      --arg  due_at              "$due_at" \
+      --arg  close_reason        "$close_reason" \
+      --arg  created_at          "$created_at" \
+      --arg  updated_at          "$updated_at" \
+      --arg  milestone           "$milestone" \
+      --arg  parent_speckit_id   "$parent_id" \
+      '{
+        external_id:          $external_id,
+        title:                $title,
+        description:          (if $description          != "" then $description          else null end),
+        acceptance_criteria:  (if $acceptance_criteria  != "" then $acceptance_criteria  else null end),
+        notes:                (if $notes                != "" then $notes                else null end),
+        spec_id:              $spec_id,
+        status:               $status,
+        priority:             $priority,
+        issue_type:           $issue_type,
+        assignee:             (if $assignee             != "" then $assignee             else null end),
+        labels:               $labels,
+        external_ref:         $external_ref,
+        source_system:        $source_system,
+        estimated_minutes:    (if $estimated_minutes    >  0  then $estimated_minutes    else null end),
+        due_at:               (if $due_at               != "" then $due_at               else null end),
+        close_reason:         (if $close_reason         != "" then $close_reason         else null end),
+        created_at:           $created_at,
+        updated_at:           $updated_at,
+        metadata: {
+          speckit_id:                $spec_id,
+          milestone:                 (if $milestone           != "" then $milestone           else null end),
+          parent_speckit_id:         (if $parent_speckit_id   != "" then $parent_speckit_id   else null end),
+          github_issue_number:       null,
+          github_issue_url:          null,
+          github_issue_synced_at:    null,
+          github_issue_synced_hash:  null,
+          content_hash:              null
+        }
+      } | with_entries(select(.value != null))')
+
+    # ---- Content hash (computed after core fields are stable) --------------
+    local content_hash
+    content_hash=$(compute_content_hash "$bead_json")
+    bead_json=$(printf '%s' "$bead_json" \
+      | jq --arg h "$content_hash" '.metadata.content_hash = $h')
+
+    # ---- Idempotency check -------------------------------------------------
+    if [[ -f "$bead_path" ]]; then
+      local existing_hash
+      existing_hash=$(jq -r '.metadata.content_hash // ""' "$bead_path" 2>/dev/null || true)
+
+      if [[ "$existing_hash" == "$content_hash" ]]; then
+        log_debug "Bead $external_id unchanged — skipped"
+        (( skipped++ )); continue
+      fi
+
+      log_info "Updating bead: $bead_filename"
+
+      if [[ "$DRY_RUN" != true ]]; then
+        # Preserve any existing GitHub sync state
+        local gh_num gh_url gh_synced gh_synced_hash
+        gh_num=$(jq -r         '.metadata.github_issue_number      // empty' "$bead_path")
+        gh_url=$(jq -r         '.metadata.github_issue_url         // empty' "$bead_path")
+        gh_synced=$(jq -r      '.metadata.github_issue_synced_at   // empty' "$bead_path")
+        gh_synced_hash=$(jq -r '.metadata.github_issue_synced_hash // empty' "$bead_path")
+
+        # Re-inject preserved sync metadata
+        [[ -n "$gh_num" ]]         && bead_json=$(printf '%s' "$bead_json" | jq --argjson n "$gh_num"              '.metadata.github_issue_number      = $n')
+        [[ -n "$gh_url" ]]         && bead_json=$(printf '%s' "$bead_json" | jq --arg     u "$gh_url"              '.metadata.github_issue_url         = $u')
+        [[ -n "$gh_synced" ]]      && bead_json=$(printf '%s' "$bead_json" | jq --arg     s "$gh_synced"           '.metadata.github_issue_synced_at   = $s')
+        [[ -n "$gh_synced_hash" ]] && bead_json=$(printf '%s' "$bead_json" | jq --arg     h "$gh_synced_hash"      '.metadata.github_issue_synced_hash = $h')
+
+        printf '%s\n' "$bead_json" | jq '.' > "$bead_path"
+      else
+        log_dry "Would overwrite: $bead_path"
+      fi
+      (( updated++ ))
+
+    else
+      log_info "Creating bead : $bead_filename  ($external_id)"
+      if [[ "$DRY_RUN" != true ]]; then
+        printf '%s\n' "$bead_json" | jq '.' > "$bead_path"
+      else
+        log_dry "Would create: $bead_path"
+        [[ "$VERBOSE" == true ]] && printf '%s\n' "$bead_json" | jq '.'
+      fi
+      (( created++ ))
+    fi
+
+  done < <(jq -c '.tasks[]' "$speckit_file")
+
+  printf '\n'
+  log_info "speckit-to-beads complete — created: $created, updated: $updated, skipped: $skipped, failed: $failed"
+  [[ "$DRY_RUN" == true ]] && log_warn "Dry-run — no files were written."
+  [[ $failed -eq 0 ]] || return 1
+}
+
+# =============================================================================
+# GITHUB BODY FORMATTER
+# =============================================================================
+
+# Produces a clean GitHub Markdown issue body.
+# The hidden HTML comment <!-- beadsync:external_id:... --> is the idempotency
+# anchor used by find_gh_issue_by_external_id().
+format_gh_body() {
+  local bead_json="$1"
+
+  local title description acc_criteria notes spec_id external_id
+  local due_at assignee estimated_minutes issue_type priority milestone
+  title=$(printf '%s'             "$bead_json" | jq -r '.title                // ""')
+  description=$(printf '%s'       "$bead_json" | jq -r '.description          // ""')
+  acc_criteria=$(printf '%s'      "$bead_json" | jq -r '.acceptance_criteria  // ""')
+  notes=$(printf '%s'             "$bead_json" | jq -r '.notes                // ""')
+  spec_id=$(printf '%s'           "$bead_json" | jq -r '.spec_id              // ""')
+  external_id=$(printf '%s'       "$bead_json" | jq -r '.external_id         // ""')
+  due_at=$(printf '%s'            "$bead_json" | jq -r '.due_at               // ""')
+  assignee=$(printf '%s'          "$bead_json" | jq -r '.assignee             // ""')
+  estimated_minutes=$(printf '%s' "$bead_json" | jq -r '.estimated_minutes    // 0')
+  issue_type=$(printf '%s'        "$bead_json" | jq -r '.issue_type           // "task"')
+  priority=$(printf '%s'          "$bead_json" | jq -r '.priority             // 2')
+  milestone=$(printf '%s'         "$bead_json" | jq -r '.metadata.milestone   // ""')
+
+  local body=""
+
+  [[ -n "$description" ]]  && body+="## Description\n\n${description}\n\n"
+  [[ -n "$acc_criteria" ]] && body+="## Acceptance Criteria\n\n${acc_criteria}\n\n"
+  [[ -n "$notes" ]]        && body+="## Notes\n\n${notes}\n\n"
+
+  # Metadata table
+  body+="---\n\n"
+  body+="| Field | Value |\n"
+  body+="| --- | --- |\n"
+  body+="| Speckit ID | \`${spec_id}\` |\n"
+  body+="| Issue type | \`${issue_type}\` |\n"
+  body+="| Priority | P${priority} |\n"
+  [[ -n "$due_at"   ]]     && body+="| Due date | \`${due_at}\` |\n"
+  [[ -n "$milestone" ]]    && body+="| Milestone | ${milestone} |\n"
+  [[ -n "$assignee" ]]     && body+="| Assignee | @${assignee} |\n"
+
+  if [[ "$estimated_minutes" -gt 0 ]]; then
+    local h=$(( estimated_minutes / 60 ))
+    local m=$(( estimated_minutes % 60 ))
+    local est=""
+    [[ $h -gt 0 ]] && est+="${h}h"
+    [[ $m -gt 0 ]] && est+=" ${m}m"
+    body+="| Estimate | \`${est}\` |\n"
+  fi
+
+  body+="\n_Managed by [beadsync](https://github.com/steveyegge/beads). "
+  body+="Edit the Bead file, not this issue._\n\n"
+  # Idempotency anchor — DO NOT REMOVE
+  body+="<!-- beadsync:external_id:${external_id} -->"
+
+  printf '%b' "$body"
+}
+
+# =============================================================================
+# GITHUB HELPERS
+# =============================================================================
+
+# Search GitHub for an issue whose body contains the idempotency anchor.
+# Returns the issue number, or empty string if not found.
+find_gh_issue_by_external_id() {
+  local repo="$1"
+  local external_id="$2"
+
+  log_debug "Searching GitHub for external_id: $external_id"
+
+  # GitHub code search is unavailable for issue bodies without full-text search,
+  # so we embed the marker in the body and use the Issues search API.
+  local query="repo:${repo} in:body beadsync:external_id:${external_id}"
+  gh api "search/issues" \
+    --method GET \
+    -f q="$query" \
+    --jq '.items[0].number // empty' 2>/dev/null || true
+}
+
+# Ensure a label exists in the repo, creating it with a random colour if not.
+ensure_label_exists() {
+  local repo="$1"
+  local label="$2"
+  [[ -z "$label" ]] && return 0
+
+  if ! gh api "repos/${repo}/labels" --jq ".[].name" 2>/dev/null \
+        | grep -qxF "$label"; then
+    log_debug "Creating label: $label"
+    local colour
+    colour=$(printf '%06X' $(( RANDOM % 16777215 )))
+    gh api "repos/${repo}/labels" \
+      --method POST \
+      -f name="$label" \
+      -f color="$colour" \
+      --silent &>/dev/null || log_warn "Could not create label: $label"
+  fi
+}
+
+# Resolve a milestone title to its numeric ID (or empty string).
+get_milestone_id() {
+  local repo="$1"
+  local title="$2"
+  [[ -z "$title" ]] && return 0
+  gh api "repos/${repo}/milestones" \
+    --jq ".[] | select(.title == \"${title}\") | .number" \
+    2>/dev/null | head -1 || true
+}
+
+# Build a JSON array of labels from a newline-separated list.
+labels_to_json_array() {
+  local labels_raw="$1"
+  printf '%s' "$labels_raw" | jq -Rc '[inputs | select(length > 0)]'
+}
+
+# =============================================================================
+# BEADS → GITHUB
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Field mapping contract — Bead → GitHub Issue
+#
+# Bead field               GitHub field        Notes
+# ─────────────────────────────────────────────────────────────────────────
+# title                  → title              direct
+# description            → body (section)     composed markdown
+# acceptance_criteria    → body (section)     composed markdown
+# notes                  → body (section)     composed markdown
+# spec_id                → body (table row)   reference only
+# external_id            → body (HTML comment) idempotency anchor
+# labels[]               → labels[]           created if missing
+# assignee               → assignees[0]       single assignee
+# metadata.milestone     → milestone.title    resolved to milestone number
+# status == "closed"     → state = "closed"   open otherwise
+# metadata.github_issue_number ← stored back after create/update
+# metadata.github_issue_url    ← stored back after create/update
+# metadata.github_issue_synced_at ← timestamp of last successful sync
+# metadata.github_issue_synced_hash ← content_hash at last sync
+# ---------------------------------------------------------------------------
+
+# Global used by _sync_one_bead to avoid stdout pollution in subshells.
+_BEAD_SYNC_RESULT=""
+
+_sync_one_bead() {
+  local repo="$1"
+  local bead_file="$2"
+  local force_update="$3"
+  # Sets _BEAD_SYNC_RESULT to: "created" | "updated" | "skipped" | "failed"
+
+  _BEAD_SYNC_RESULT="failed"
+
+  local bead_json
+  bead_json=$(jq '.' "$bead_file") || { log_warn "Invalid JSON: $bead_file"; return; }
+
+  local external_id title
+  external_id=$(printf '%s' "$bead_json" | jq -r '.external_id // ""')
+  title=$(printf '%s'       "$bead_json" | jq -r '.title       // ""')
+
+  if [[ -z "$external_id" || -z "$title" ]]; then
+    log_warn "Bead missing external_id or title: $bead_file"
+    return
+  fi
+
+  log_debug "Syncing bead: $external_id"
+
+  # ---- Resolve existing GitHub issue number (skipped in dry-run) -----------
+  local gh_number=""
+  local stored_number
+  stored_number=$(printf '%s' "$bead_json" | jq -r '.metadata.github_issue_number // empty')
+
+  if [[ -n "$stored_number" && "$stored_number" != "null" ]]; then
+    gh_number="$stored_number"
+    log_debug "  Stored issue number: #$gh_number"
+  elif [[ "$DRY_RUN" != true ]]; then
+    gh_number=$(find_gh_issue_by_external_id "$repo" "$external_id")
+    [[ -n "$gh_number" ]] && log_debug "  Found via search: #$gh_number"
+  fi
+
+  # ---- Prepare GitHub payload ----------------------------------------------
+  local body
+  body=$(format_gh_body "$bead_json")
+
+  local labels_raw
+  labels_raw=$(printf '%s' "$bead_json" | jq -r '.labels // [] | .[]' 2>/dev/null)
+
+  local assignee
+  assignee=$(printf '%s' "$bead_json" | jq -r '.assignee // ""')
+
+  local bead_status gh_state
+  bead_status=$(printf '%s' "$bead_json" | jq -r '.status // "open"')
+  [[ "$bead_status" == "closed" ]] && gh_state="closed" || gh_state="open"
+
+  # ---- Ensure labels exist (skip in dry-run) -------------------------------
+  if [[ "$DRY_RUN" != true ]]; then
+    while IFS= read -r lbl; do
+      [[ -n "$lbl" ]] && ensure_label_exists "$repo" "$lbl"
+    done <<< "$labels_raw"
+  fi
+
+  # ---- Milestone (skip in dry-run) -----------------------------------------
+  local milestone_title milestone_id=""
+  milestone_title=$(printf '%s' "$bead_json" | jq -r '.metadata.milestone // ""')
+  if [[ -n "$milestone_title" && "$DRY_RUN" != true ]]; then
+    milestone_id=$(get_milestone_id "$repo" "$milestone_title")
+  fi
+
+  local now
+  now=$(iso8601_now)
+  local current_hash
+  current_hash=$(printf '%s' "$bead_json" | jq -r '.metadata.content_hash // ""')
+
+  # ---- CREATE new issue ----------------------------------------------------
+  if [[ -z "$gh_number" ]]; then
+    log_info "  Creating issue: $title"
+
+    if [[ "$DRY_RUN" == true ]]; then
+      local dry_labels
+      dry_labels=$(printf '%s' "$labels_raw" | tr '\n' ' ')
+      log_dry "  Would create: $title  [labels: ${dry_labels:-none}]"
+      _BEAD_SYNC_RESULT="created"; return
+    fi
+
+    local create_args=(--repo "$repo" --title "$title" --body "$body")
+    while IFS= read -r lbl; do
+      [[ -n "$lbl" ]] && create_args+=(--label "$lbl")
+    done <<< "$labels_raw"
+    [[ -n "$assignee" ]] && create_args+=(--assignee "$assignee")
+
+    local gh_response
+    if ! gh_response=$(gh issue create "${create_args[@]}" 2>&1); then
+      log_error "  Failed to create issue '$title': $gh_response"
+      return
+    fi
+
+    local gh_url gh_num_new
+    gh_url=$(printf '%s' "$gh_response" | grep -Eo 'https://github\.com/[^ ]+' | head -1)
+    gh_num_new=$(printf '%s' "$gh_url" | grep -Eo '[0-9]+$')
+
+    # Close immediately if bead status is closed
+    [[ "$gh_state" == "closed" && -n "$gh_num_new" ]] && \
+      gh issue close "$gh_num_new" --repo "$repo" &>/dev/null || true
+
+    log_info "  Created: $gh_url"
+
+    # Write back GitHub metadata into the bead file
+    printf '%s' "$bead_json" | jq \
+      --argjson num  "$gh_num_new" \
+      --arg     url  "$gh_url" \
+      --arg     sync "$now" \
+      --arg     hash "$current_hash" \
+      '.metadata.github_issue_number      = $num  |
+       .metadata.github_issue_url         = $url  |
+       .metadata.github_issue_synced_at   = $sync |
+       .metadata.github_issue_synced_hash = $hash' \
+      > "${bead_file}.tmp" && mv "${bead_file}.tmp" "$bead_file"
+
+    _BEAD_SYNC_RESULT="created"; return
+  fi
+
+  # ---- UPDATE existing issue -----------------------------------------------
+  local synced_hash
+  synced_hash=$(printf '%s' "$bead_json" | jq -r '.metadata.github_issue_synced_hash // ""')
+
+  if [[ "$current_hash" == "$synced_hash" && "$force_update" != true ]]; then
+    log_debug "  Issue #$gh_number unchanged — skipped"
+    _BEAD_SYNC_RESULT="skipped"; return
+  fi
+
+  log_info "  Updating issue #$gh_number: $title"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "  Would update #$gh_number: $title"
+    _BEAD_SYNC_RESULT="updated"; return
+  fi
+
+  # Use REST API for updates (gh issue edit --add-label doesn't replace labels)
+  local labels_json_arr
+  labels_json_arr=$(labels_to_json_array "$labels_raw")
+
+  local patch_data=()
+  patch_data+=(-f  title="$title")
+  patch_data+=(-f  body="$body")
+  patch_data+=(-f  state="$gh_state")
+  [[ -n "$milestone_id" ]] && patch_data+=(-F milestone="$milestone_id")
+
+  if ! gh api "repos/${repo}/issues/${gh_number}" \
+        --method PATCH "${patch_data[@]}" --silent; then
+    log_error "  Failed to update issue #$gh_number"
+    return
+  fi
+
+  # Replace labels atomically via the labels endpoint
+  if printf '%s' "$labels_json_arr" | jq -e 'length > 0' &>/dev/null; then
+    gh api "repos/${repo}/issues/${gh_number}/labels" \
+      --method PUT \
+      --input <(printf '%s' "$labels_json_arr" | jq '{labels: .}') \
+      --silent &>/dev/null || log_warn "  Could not update labels on #$gh_number"
+  fi
+
+  # Set assignee
+  if [[ -n "$assignee" ]]; then
+    gh api "repos/${repo}/issues/${gh_number}/assignees" \
+      --method POST \
+      -F "assignees[]=$assignee" \
+      --silent &>/dev/null || log_warn "  Could not set assignee on #$gh_number"
+  fi
+
+  log_info "  Updated: https://github.com/${repo}/issues/${gh_number}"
+
+  # Write back updated sync metadata
+  printf '%s' "$bead_json" | jq \
+    --arg sync "$now" \
+    --arg hash "$current_hash" \
+    '.metadata.github_issue_synced_at   = $sync |
+     .metadata.github_issue_synced_hash = $hash' \
+    > "${bead_file}.tmp" && mv "${bead_file}.tmp" "$bead_file"
+
+  _BEAD_SYNC_RESULT="updated"
+}
+
+_run_gh_sync() {
+  local beads_dir="$1"
+  local repo="$2"
+  local force_update="$3"
+
+  [[ -d "$beads_dir" ]] || die "Beads directory not found: $beads_dir"
+  [[ "$repo" =~ ^[^/]+/[^/]+$ ]] || die "Invalid --repo format (expected owner/name): $repo"
+
+  [[ "$DRY_RUN" != true ]] && check_gh_dep
+
+  log_info "Repository : $repo"
+  log_info "Beads dir  : $beads_dir"
+  [[ "$DRY_RUN"      == true ]] && log_warn "Dry-run mode — no changes will be made"
+  [[ "$force_update" == true ]] && log_warn "Force mode  — all issues will be updated"
+
+  local created=0 updated=0 skipped=0 failed=0
+  local bead_count=0
+
+  for bead_file in "$beads_dir"/bead-*.json; do
+    [[ -f "$bead_file" ]] || continue
+    (( bead_count++ ))
+
+    _BEAD_SYNC_RESULT="failed"
+    _sync_one_bead "$repo" "$bead_file" "$force_update" || true
+
+    case "$_BEAD_SYNC_RESULT" in
+      created) (( created++ )) ;;
+      updated) (( updated++ )) ;;
+      skipped) (( skipped++ )) ;;
+      *)       (( failed++  )) ;;
+    esac
+  done
+
+  if [[ $bead_count -eq 0 ]]; then
+    log_warn "No bead-*.json files found in: $beads_dir"
+    return 0
+  fi
+
+  printf '\n'
+  log_info "Sync complete — created: $created, updated: $updated, skipped: $skipped, failed: $failed"
+  [[ $failed -eq 0 ]] || { log_error "$failed bead(s) failed to sync"; return 1; }
+}
+
+cmd_beads_to_gh() {
+  local beads_dir=""
+  local repo=""
+  local force_update=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo|-r)    repo="$2"; shift 2 ;;
+      --force)      force_update=true; shift ;;
+      --dry-run)    DRY_RUN=true;       shift ;;
+      --verbose|-v) VERBOSE=true;       shift ;;
+      -*)           die "Unknown option: $1" ;;
+      *)
+        [[ -z "$beads_dir" ]] && beads_dir="$1"
+        shift ;;
+    esac
+  done
+
+  [[ -n "$beads_dir" ]] || die_usage "Usage: beadsync beads-to-gh <beads_dir> --repo owner/name"
+  [[ -n "$repo" ]]      || die_usage "--repo owner/name is required"
+
+  _run_gh_sync "$beads_dir" "$repo" "$force_update"
+}
+
+cmd_sync() {
+  local beads_dir=""
+  local repo=""
+  local force_update=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo|-r)    repo="$2"; shift 2 ;;
+      --force)      force_update=true; shift ;;
+      --dry-run)    DRY_RUN=true;       shift ;;
+      --verbose|-v) VERBOSE=true;       shift ;;
+      -*)           die "Unknown option: $1" ;;
+      *)
+        [[ -z "$beads_dir" ]] && beads_dir="$1"
+        shift ;;
+    esac
+  done
+
+  [[ -n "$beads_dir" ]] || die_usage "Usage: beadsync sync <beads_dir> --repo owner/name"
+  [[ -n "$repo" ]]      || die_usage "--repo owner/name is required"
+
+  _run_gh_sync "$beads_dir" "$repo" "$force_update"
+}
+
+# =============================================================================
+# STATUS REPORT
+# =============================================================================
+
+cmd_status() {
+  local beads_dir="${1:-./beads}"
+  [[ -d "$beads_dir" ]] || die "Beads directory not found: $beads_dir"
+
+  local total=0 synced=0 pending=0
+
+  printf '%-50s %-12s %-12s %s\n' "Bead file" "Status" "GH Issue" "Synced?"
+  printf '%s\n' "$(printf '%0.s─' {1..100})"
+
+  for bead_file in "$beads_dir"/bead-*.json; do
+    [[ -f "$bead_file" ]] || continue
+    (( total++ ))
+
+    local title status gh_num synced_hash content_hash
+    title=$(jq -r '.title // "(untitled)"' "$bead_file")
+    status=$(jq -r '.status // "?"' "$bead_file")
+    gh_num=$(jq -r '.metadata.github_issue_number // "-"' "$bead_file")
+    synced_hash=$(jq -r '.metadata.github_issue_synced_hash // ""' "$bead_file")
+    content_hash=$(jq -r '.metadata.content_hash // ""' "$bead_file")
+
+    local sync_state
+    if [[ "$gh_num" == "-" || "$gh_num" == "null" ]]; then
+      sync_state="not synced"
+      (( pending++ ))
+    elif [[ "$synced_hash" != "$content_hash" ]]; then
+      sync_state="needs update"
+      (( pending++ ))
+    else
+      sync_state="up to date"
+      (( synced++ ))
+    fi
+
+    printf '%-50s %-12s %-12s %s\n' \
+      "$(basename "$bead_file" | cut -c1-49)" \
+      "$status" \
+      "#$gh_num" \
+      "$sync_state"
+  done
+
+  printf '\n'
+  log_info "Total: $total | Synced: $synced | Needs sync: $pending"
+}
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+show_usage() {
+  cat <<EOF
+${BOLD}beadsync${RESET} v${VERSION}  —  Speckit → Beads → GitHub Issues
+
+${BOLD}USAGE${RESET}
+  beadsync <command> [options]
+
+${BOLD}COMMANDS${RESET}
+
+  ${CYAN}speckit-to-beads${RESET}  <speckit.json>  [--out DIR]  [--project ID]
+    Convert a Speckit JSON export into individual Bead files.
+    Idempotent: re-running updates only changed tasks.
+
+      --out, -o DIR    Output directory   (default: ./beads)
+      --project, -p ID Project identifier used to namespace Bead IDs.
+                       Auto-read from export's project.id field; falls
+                       back to the filename stem if absent.
+      --dry-run        Preview without writing files
+      --verbose, -v    Verbose output
+
+  ${CYAN}beads-to-gh${RESET}  <beads_dir>  --repo owner/name
+    Push Bead files to GitHub Issues.  Creates new issues and updates
+    existing ones.  Manual GitHub edits are preserved unless --force.
+
+      --repo, -r REPO  GitHub repo, e.g. acme/my-project  (required)
+      --force          Override GitHub edits; always push Bead content
+      --dry-run        Preview without touching GitHub
+      --verbose, -v    Verbose output
+
+  ${CYAN}sync${RESET}  <beads_dir>  --repo owner/name
+    Alias for beads-to-gh.  Only pushes Beads whose content has changed.
+
+      Same options as beads-to-gh.
+
+  ${CYAN}status${RESET}  [beads_dir]
+    Print a table of all Beads and their GitHub sync state.
+    (default dir: ./beads)
+
+${BOLD}ENVIRONMENT VARIABLES${RESET}
+
+  GITHUB_TOKEN    Optional — gh CLI manages auth by default (gh auth login)
+
+${BOLD}DEPENDENCIES${RESET}
+
+  Required: bash ≥ 4.3, jq, gh (GitHub CLI)
+  macOS:    shasum (built-in)  or  sha256sum
+
+  Install: brew install jq gh
+
+${BOLD}EXIT CODES${RESET}
+
+  0   Success
+  1   Runtime error (e.g. a bead failed to sync)
+  2   Usage / argument error
+
+${BOLD}EXAMPLES${RESET}
+
+  # Phase 1 — convert Speckit tasks to Bead files
+  ./beadsync speckit-to-beads speckit_export.json --out ./beads
+  ./beadsync speckit-to-beads speckit_export.json --out ./beads --dry-run
+
+  # Phase 2a — push all Beads to GitHub (first time)
+  ./beadsync beads-to-gh ./beads --repo acme/my-project --dry-run
+  ./beadsync beads-to-gh ./beads --repo acme/my-project
+
+  # Phase 2b — sync changed Beads (idempotent, run as often as needed)
+  ./beadsync sync ./beads --repo acme/my-project
+
+  # Force-push all Beads (overrides any manual GitHub edits)
+  ./beadsync sync ./beads --repo acme/my-project --force
+
+  # Check sync state without touching anything
+  ./beadsync status ./beads
+
+${BOLD}SOURCE OF TRUTH MODEL${RESET}
+
+  1. Speckit is canonical until Beads are generated.
+  2. After Beads exist, Beads are the source of truth.
+  3. GitHub Issues are read-only projections of Beads.
+  4. GitHub edits do NOT override Beads (unless --force is used).
+  5. Changes flow:
+       Phase 1:  Speckit → beadsync speckit-to-beads → Bead files
+       Phase 2:  Bead files → beadsync sync → GitHub Issues
+
+EOF
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+  check_core_deps
+
+  [[ $# -gt 0 ]] || { show_usage; exit 0; }
+
+  local cmd="$1"; shift
+
+  case "$cmd" in
+    speckit-to-beads|s2b)   cmd_speckit_to_beads "$@" ;;
+    beads-to-gh|b2g)        cmd_beads_to_gh "$@" ;;
+    sync)                   cmd_sync "$@" ;;
+    status|st)              cmd_status "$@" ;;
+    version|--version|-V)   printf 'beadsync v%s\n' "$VERSION"; exit 0 ;;
+    help|--help|-h)         show_usage; exit 0 ;;
+    *)
+      log_error "Unknown command: $cmd"
+      show_usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
