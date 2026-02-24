@@ -88,6 +88,46 @@ require_dir() {
 
 require_file() { [[ -f "$1" ]] || die "File not found: $1"; }
 
+# Ensure the given directory path is listed in the nearest .gitignore.
+# Silently skips if not inside a git repository.
+ensure_gitignored() {
+  local target_dir="$1"
+
+  # Resolve git root — bail out quietly if not in a repo
+  local git_root
+  git_root=$(git -C "$(dirname "$(mkdir -p "$target_dir"; cd "$target_dir" && pwd)")" \
+    rev-parse --show-toplevel 2>/dev/null) || return 0
+
+  local gitignore="$git_root/.gitignore"
+
+  # Compute path relative to git root.
+  # Use os.path.realpath to resolve /tmp → /private/tmp on macOS before comparing.
+  local abs_target
+  abs_target=$(mkdir -p "$target_dir"; cd "$target_dir" && pwd)
+  local rel_path
+  rel_path=$(python3 -c \
+    "import os,sys; print(os.path.relpath(os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])))" \
+    "$abs_target" "$git_root" 2>/dev/null) \
+    || rel_path="${target_dir#./}"   # fallback: strip leading ./
+
+  # Already ignored — nothing to do (check both with and without trailing slash)
+  if [[ -f "$gitignore" ]] && grep -qxF "$rel_path"   "$gitignore" 2>/dev/null; then
+    log_debug "$rel_path already in .gitignore"; return 0
+  fi
+  if [[ -f "$gitignore" ]] && grep -qxF "${rel_path}/" "$gitignore" 2>/dev/null; then
+    log_debug "${rel_path}/ already in .gitignore"; return 0
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would add '$rel_path/' to $gitignore"
+    return 0
+  fi
+
+  # Append entry with trailing slash (marks it as a directory in gitignore)
+  printf '\n# beadsync — generated Bead files (do not commit)\n%s/\n' "$rel_path" >> "$gitignore"
+  log_info "Added '$rel_path/' to $gitignore"
+}
+
 validate_json_file() {
   jq empty "$1" 2>/dev/null || die "Invalid JSON in file: $1"
 }
@@ -281,6 +321,7 @@ cmd_speckit_to_beads() {
   [[ "$DRY_RUN" == true ]] && log_warn "Dry-run mode — no files will be written"
 
   require_dir "$out_dir"
+  ensure_gitignored "$out_dir"
 
   local created=0 updated=0 skipped=0 failed=0
 
