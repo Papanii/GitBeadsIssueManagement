@@ -14,7 +14,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 # ---------------------------------------------------------------------------
 # Colours (disabled when not a TTY)
@@ -68,6 +68,32 @@ check_gh_dep() {
 check_bd_dep() {
   command -v bd &>/dev/null \
     || die "bd (Beads CLI) required.  Install: npm i -g @beads/bd  (or: brew install beads)"
+}
+
+# Verify that a bd database has been initialised in (or above) the current
+# directory.  Called after check_bd_dep so the error is targeted rather than
+# a raw bd failure message.
+check_bd_init() {
+  if ! bd list --limit 1 --json &>/dev/null 2>&1; then
+    die "No bd database found in this directory." \
+        $'\n       ''Run '\''bd init'\'' in your project root, then try again.'
+  fi
+}
+
+# Warn when .beads/issues.jsonl exists but the local bd database is empty.
+# This almost always means the user forgot `bd import` after a `git pull`.
+# Non-fatal — we warn and let the command continue so the user can decide.
+check_bd_stale() {
+  [[ -f ".beads/issues.jsonl" ]] || return 0  # no JSONL → nothing to check
+
+  local count
+  count=$(bd list --all --limit 1 --json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+
+  if [[ "$count" == "0" ]]; then
+    log_warn "bd database is empty but .beads/issues.jsonl exists."
+    log_warn "Did you forget to run: bd import -i .beads/issues.jsonl"
+    log_warn "Continuing — beads will be created fresh from this run."
+  fi
 }
 
 # =============================================================================
@@ -295,6 +321,8 @@ cmd_speckit_to_beads() {
   validate_json_file "$speckit_file"
 
   [[ "$DRY_RUN" != true ]] && check_bd_dep
+  [[ "$DRY_RUN" != true ]] && check_bd_init
+  [[ "$DRY_RUN" != true ]] && check_bd_stale
 
   # Validate that .tasks is an array
   local tasks_type task_count
@@ -890,6 +918,8 @@ _run_gh_sync() {
   [[ "$repo" =~ ^[^/]+/[^/]+$ ]] || die "Invalid --repo format (expected owner/name): $repo"
 
   [[ "$DRY_RUN" != true ]] && check_bd_dep
+  [[ "$DRY_RUN" != true ]] && check_bd_init
+  [[ "$DRY_RUN" != true ]] && check_bd_stale
   [[ "$DRY_RUN" != true ]] && check_gh_dep
 
   log_info "Repository : $repo"
@@ -992,12 +1022,18 @@ cmd_sync() {
 
 cmd_status() {
   check_bd_dep
+  check_bd_init
 
   local beads_list
   beads_list=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
 
   if [[ -z "$beads_list" || "$beads_list" == "[]" || "$beads_list" == "null" ]]; then
-    log_warn "No beads with label 'speckit' found.  Run: beadsync speckit-to-beads first."
+    if [[ -f ".beads/issues.jsonl" ]]; then
+      log_warn "bd database is empty but .beads/issues.jsonl exists."
+      log_warn "Run: bd import -i .beads/issues.jsonl  then try again."
+    else
+      log_warn "No beads with label 'speckit' found.  Run: beadsync speckit-to-beads first."
+    fi
     return 0
   fi
 
