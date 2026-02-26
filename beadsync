@@ -226,17 +226,6 @@ compute_content_hash() {
 # BD HELPERS
 # =============================================================================
 
-# Find the bd issue ID for a given external_ref.
-# Searches beads labeled 'speckit', then matches external_ref exactly.
-# Prints the bd issue ID (e.g. "bd-abc123"), or nothing if not found.
-bd_find_by_external_ref() {
-  local external_ref="$1"
-  bd list --all --limit 0 -l speckit --json 2>/dev/null \
-    | jq -r --arg ref "$external_ref" \
-        '.[] | select(.external_ref == $ref) | .id' \
-    | head -1
-}
-
 # Get a single bead's full JSON from bd by its ID.
 # Always returns a single JSON object (handles both object and array responses).
 bd_get_bead_json() {
