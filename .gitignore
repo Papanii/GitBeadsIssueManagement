@@ -1,5 +1,10 @@
-# Generated bead files (project-specific, not shared)
+# Legacy: custom bead files from beadsync v1
 beads/
+
+# bd (Beads CLI) — binary Dolt database, never commit
+# Commit .beads/issues.jsonl instead (auto-exported by beadsync)
+.beads/dolt/
+.beads/*.db
 
 # macOS
 .DS_Store

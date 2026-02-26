@@ -47,6 +47,18 @@ npm i -g @beads/bd
 - `gh` — GitHub CLI (only needed for `beads-to-gh` / `sync`)
 - `bd` — Beads CLI (required for all commands; manages the Bead database)
 
+### First-time project setup
+
+In your project repo, add this to `.gitignore` to exclude the binary Dolt database while keeping the git-trackable JSONL:
+
+```
+# bd (Beads CLI) — binary database, never commit
+.beads/dolt/
+.beads/*.db
+```
+
+Then run `bd init` in your project root to initialise the bead database.
+
 ---
 
 ## Installation
@@ -285,6 +297,42 @@ See [`examples/speckit_export.json`](examples/speckit_export.json) for a complet
 | `metadata.milestone` | milestone | Resolved to GitHub milestone number |
 | `status == "closed"` | state = `closed` | Open otherwise |
 | — | body (HTML comment) | Hidden idempotency anchor |
+
+---
+
+## Team workflow (multi-machine)
+
+beadsync automatically exports `.beads/issues.jsonl` after every write command (`speckit-to-beads` and `sync`). This JSONL file is one bead per line — plain text, git-diffable, and auto-mergeable when different beads are modified concurrently.
+
+**Never commit `.beads/dolt/`** — it's a binary Dolt database that will produce unresolvable merge conflicts. Only commit `issues.jsonl`.
+
+```
+.beads/
+  dolt/           ← binary — in .gitignore
+  *.db            ← binary — in .gitignore
+  issues.jsonl    ← text, one bead per line — commit this
+```
+
+### Daily workflow
+
+```bash
+# 1. Get the latest beads from the shared repo
+git pull
+bd import -i .beads/issues.jsonl    # rebuild your local Dolt DB
+
+# 2. Do your work
+beadsync speckit-to-beads export.json          # auto-exports issues.jsonl
+beadsync sync --repo acme/my-project           # auto-exports issues.jsonl
+
+# 3. Share the updated bead database
+git add .beads/issues.jsonl
+git commit -m "Update beads from Speckit export"
+git push
+```
+
+### Why concurrent conflicts are rare
+
+Since Speckit drives all bead creation, two people running `speckit-to-beads` from the same export produce identical output — the second run hits "skipped" on every bead. The only real conflict risk is manual `bd update` edits outside of beadsync, which follow normal git merge resolution on the JSONL.
 
 ---
 

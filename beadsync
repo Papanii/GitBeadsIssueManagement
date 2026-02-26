@@ -14,7 +14,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # ---------------------------------------------------------------------------
 # Colours (disabled when not a TTY)
@@ -68,6 +68,32 @@ check_gh_dep() {
 check_bd_dep() {
   command -v bd &>/dev/null \
     || die "bd (Beads CLI) required.  Install: npm i -g @beads/bd  (or: brew install beads)"
+}
+
+# =============================================================================
+# BD DATABASE EXPORT
+# =============================================================================
+
+# Export the full bd database to .beads/issues.jsonl so it can be committed
+# to git and shared with the team.  Non-fatal — a warning is emitted on failure
+# so the rest of the command still reports its summary correctly.
+bd_export_jsonl() {
+  local jsonl_path=".beads/issues.jsonl"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would export bead database → $jsonl_path"
+    return 0
+  fi
+
+  log_info "Exporting bead database → $jsonl_path"
+
+  if ! bd export -o "$jsonl_path" -q 2>&1; then
+    log_warn "Could not export bead database to $jsonl_path"
+    return 0  # non-fatal; sync state is still correct in bd
+  fi
+
+  log_info "  Done.  Commit $jsonl_path to share beads with your team."
+  log_info "  Others can load it with: bd import -i $jsonl_path"
 }
 
 # =============================================================================
@@ -521,6 +547,10 @@ cmd_speckit_to_beads() {
   printf '\n'
   log_info "speckit-to-beads complete — created: $created, updated: $updated, skipped: $skipped, failed: $failed"
   [[ "$DRY_RUN" == true ]] && log_warn "Dry-run — no beads were created or updated."
+
+  # Keep .beads/issues.jsonl current so it can be committed to git
+  [[ $(( created + updated )) -gt 0 ]] && bd_export_jsonl
+
   [[ $failed -eq 0 ]] || return 1
 }
 
@@ -909,6 +939,10 @@ _run_gh_sync() {
 
   printf '\n'
   log_info "Sync complete — created: $created, updated: $updated, skipped: $skipped, failed: $failed"
+
+  # Keep .beads/issues.jsonl current (captures github_issue_* metadata write-backs)
+  [[ $(( created + updated )) -gt 0 ]] && bd_export_jsonl
+
   [[ $failed -eq 0 ]] || { log_error "$failed bead(s) failed to sync"; return 1; }
 }
 
@@ -1066,6 +1100,25 @@ ${BOLD}DEPENDENCIES${RESET}
 
   Install: brew install jq gh
            npm i -g @beads/bd   (or: brew install beads)
+
+${BOLD}TEAM WORKFLOW (multi-machine)${RESET}
+
+  beadsync auto-exports .beads/issues.jsonl after every write command so the
+  bead database can be committed to git and shared with your team.
+
+  Setup — add to your project's .gitignore:
+    .beads/dolt/          ← binary Dolt DB, never commit
+    .beads/*.db
+
+  Commit the JSONL (one bead per line, git-mergeable):
+    git add .beads/issues.jsonl && git commit -m "Update beads"
+
+  Workflow for each team member:
+    git pull
+    bd import -i .beads/issues.jsonl   ← rebuild local Dolt DB
+    beadsync speckit-to-beads ...      ← creates/updates beads + auto-exports
+    beadsync sync --repo ...           ← pushes to GitHub   + auto-exports
+    git add .beads/issues.jsonl && git commit && git push
 
 ${BOLD}EXIT CODES${RESET}
 
