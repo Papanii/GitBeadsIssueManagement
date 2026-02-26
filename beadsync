@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # beadsync — Speckit → Beads → GitHub Issues workflow bridge
-# Version  : 2.0.0
+# Version  : 2.3.0
 # Requires : bash ≥ 4.3, jq, gh (GitHub CLI), bd (Beads CLI)
 # =============================================================================
 # SOURCE OF TRUTH MODEL
@@ -14,7 +14,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 # ---------------------------------------------------------------------------
 # Colours (disabled when not a TTY)
@@ -358,6 +358,11 @@ cmd_speckit_to_beads() {
 
   local created=0 updated=0 skipped=0 failed=0
 
+  # Pre-fetch the full list once so idempotency lookups are O(1) instead of O(n).
+  local _all_beads_json=""
+  [[ "$DRY_RUN" != true ]] && \
+    _all_beads_json=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
+
   while IFS= read -r task_json; do
 
     # ---- Required fields ---------------------------------------------------
@@ -438,9 +443,11 @@ cmd_speckit_to_beads() {
 
     log_debug "Processing $speckit_id → external_ref: $external_ref"
 
-    # ---- Idempotency: check for existing bead in bd ------------------------
+    # ---- Idempotency: check for existing bead in bd (uses pre-fetched list) --
     local bd_id=""
-    [[ "$DRY_RUN" != true ]] && bd_id=$(bd_find_by_external_ref "$external_ref")
+    [[ "$DRY_RUN" != true ]] && bd_id=$(printf '%s' "$_all_beads_json" \
+      | jq -r --arg ref "$external_ref" '.[]? | select(.external_ref == $ref) | .id' \
+      | head -1)
 
     # ---- Base metadata (shared by create and update) -----------------------
     local base_meta_json
@@ -485,8 +492,8 @@ cmd_speckit_to_beads() {
       [[ "$estimated_minutes" -gt 0 ]] && create_args+=(-e "$estimated_minutes")
 
       local new_bd_id
-      if ! new_bd_id=$(bd create "${create_args[@]}" 2>&1); then
-        log_error "Failed to create bead for $speckit_id: $new_bd_id"
+      if ! new_bd_id=$(bd create "${create_args[@]}" 2>/dev/null); then
+        log_error "Failed to create bead for $speckit_id"
         (( failed++ )); continue
       fi
       new_bd_id=$(printf '%s' "$new_bd_id" | tr -d '[:space:]')
@@ -535,7 +542,7 @@ cmd_speckit_to_beads() {
       [[ "$estimated_minutes" -gt 0 ]] && update_args+=(-e "$estimated_minutes")
       update_args+=(-q)
 
-      if ! bd update "${update_args[@]}" 2>&1; then
+      if ! bd update "${update_args[@]}" 2>/dev/null; then
         log_error "Failed to update bead $bd_id"
         (( failed++ )); continue
       fi
@@ -830,12 +837,12 @@ _sync_one_bead() {
     # Write back GitHub metadata into the bead via bd update --metadata
     local new_meta
     new_meta=$(printf '%s' "$bd_raw_json" | jq -c \
-      --argjson num  "$gh_num_new" \
+      --arg     num  "$gh_num_new" \
       --arg     url  "$gh_url" \
       --arg     sync "$now" \
       --arg     hash "$current_hash" \
       '(.metadata // {}) + {
-        github_issue_number:      $num,
+        github_issue_number:      ($num | if . != "" then tonumber else null end),
         github_issue_url:         $url,
         github_issue_synced_at:   $sync,
         github_issue_synced_hash: $hash
@@ -931,7 +938,12 @@ _run_gh_sync() {
   beads_list=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
 
   if [[ -z "$beads_list" || "$beads_list" == "[]" || "$beads_list" == "null" ]]; then
-    log_warn "No beads with label 'speckit' found.  Run: beadsync speckit-to-beads first."
+    if [[ -f ".beads/issues.jsonl" ]]; then
+      log_warn "bd database is empty but .beads/issues.jsonl exists."
+      log_warn "Run: bd import -i .beads/issues.jsonl  then retry."
+    else
+      log_warn "No beads with label 'speckit' found.  Run: beadsync speckit-to-beads first."
+    fi
     return 0
   fi
 
