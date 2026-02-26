@@ -2,7 +2,7 @@
 
 A macOS CLI tool that bridges **Speckit → Beads → GitHub Issues**.
 
-Convert your Speckit task exports into structured [Beads](https://github.com/steveyegge/beads) files, then push them to GitHub Issues — with full idempotency, project scoping, and a clear source-of-truth model.
+Convert your Speckit task exports into real [Beads](https://github.com/steveyegge/beads) using the `bd` CLI, then push them to GitHub Issues — with full idempotency, project scoping, and a clear source-of-truth model.
 
 ---
 
@@ -15,7 +15,7 @@ Speckit export (JSON)
 beadsync speckit-to-beads          ← Phase 1
         │
         ▼
-  Bead files (./beads/*.json)      ← Source of truth after this point
+  bd (Bead database)               ← Source of truth after this point
         │
         ▼
 beadsync sync                      ← Phase 2
@@ -25,8 +25,8 @@ beadsync sync                      ← Phase 2
 ```
 
 **Source of truth rules:**
-- Speckit is canonical _until_ Beads are generated
-- After Beads exist, **Beads are the source of truth**
+- Speckit is canonical _until_ Beads are created in `bd`
+- After Beads exist in `bd`, **Beads are the source of truth**
 - GitHub Issues are downstream projections — edits there do not flow back into Beads (unless `--force` is used)
 
 ---
@@ -36,11 +36,16 @@ beadsync sync                      ← Phase 2
 ```bash
 brew install jq gh
 gh auth login
+
+# Install the Beads CLI (bd)
+npm i -g @beads/bd
+# or: brew install beads
 ```
 
 - `bash` (any version shipped with macOS works)
 - `jq` — JSON processing
 - `gh` — GitHub CLI (only needed for `beads-to-gh` / `sync`)
+- `bd` — Beads CLI (required for all commands; manages the Bead database)
 
 ---
 
@@ -68,26 +73,29 @@ After this, `beadsync` works from any directory on your machine.
 
 ## Commands
 
-### `speckit-to-beads` — Convert Speckit export to Bead files
+### `speckit-to-beads` — Convert Speckit export to Beads
 
 ```bash
 beadsync speckit-to-beads <speckit_export.json> [options]
 ```
 
+Reads each task from the Speckit export and calls `bd create` (or `bd update` if the Bead already exists). All Beads are tagged with the `speckit` label so they can be filtered by downstream commands. Fully idempotent — re-running only touches tasks that have changed.
+
 | Option | Default | Description |
 |---|---|---|
-| `--out, -o DIR` | `./beads` | Output directory for Bead files |
-| `--project, -p ID` | auto-detected | Project namespace for Bead IDs |
-| `--dry-run` | off | Preview what would be created/updated |
+| `--project, -p ID` | auto-detected | Project namespace for Bead `external_ref` values |
+| `--dry-run` | off | Preview what would be created/updated without calling `bd` |
 | `--verbose, -v` | off | Print debug output |
 
 ---
 
-### `beads-to-gh` — Push Bead files to GitHub Issues
+### `beads-to-gh` — Push Beads to GitHub Issues
 
 ```bash
-beadsync beads-to-gh <beads_dir> --repo owner/name [options]
+beadsync beads-to-gh --repo owner/name [options]
 ```
+
+Reads all Beads tagged `speckit` from the local `bd` database and pushes them to GitHub Issues. Creates new issues for unsynced Beads and updates existing issues when content has changed.
 
 | Option | Default | Description |
 |---|---|---|
@@ -101,20 +109,20 @@ beadsync beads-to-gh <beads_dir> --repo owner/name [options]
 ### `sync` — Idempotent sync of changed Beads to GitHub
 
 ```bash
-beadsync sync <beads_dir> --repo owner/name [options]
+beadsync sync --repo owner/name [options]
 ```
 
-Same options as `beads-to-gh`. Only pushes Beads whose content has changed since the last sync.
+Alias for `beads-to-gh`. Only pushes Beads whose content has changed since the last sync. Same options as `beads-to-gh`.
 
 ---
 
 ### `status` — Show sync state of all Beads
 
 ```bash
-beadsync status [beads_dir]
+beadsync status
 ```
 
-Prints a table of every Bead file, its status, GitHub issue number, and whether it needs syncing. Read-only — makes no changes.
+Prints a table of every Bead (label=`speckit`) in the `bd` database, its status, GitHub issue number, and whether it needs syncing. Read-only — makes no changes.
 
 ---
 
@@ -124,41 +132,33 @@ Prints a table of every Bead file, its status, GitHub issue number, and whether 
 
 ```bash
 beadsync speckit-to-beads export.json
-beadsync beads-to-gh ./beads --repo acme/my-project
+beadsync beads-to-gh --repo acme/my-project
 ```
 
 ### Always preview before writing
 
 ```bash
-# See what Beads would be created
+# See what Beads would be created in bd
 beadsync speckit-to-beads export.json --dry-run
 
 # See what GitHub issues would be created/updated
-beadsync beads-to-gh ./beads --repo acme/my-project --dry-run
-```
-
-### Custom output directory
-
-```bash
-beadsync speckit-to-beads export.json --out ./tasks/beads
-beadsync sync ./tasks/beads --repo acme/my-project
+beadsync beads-to-gh --repo acme/my-project --dry-run
 ```
 
 ### Multiple projects on the same machine
 
-Each project gets its own Bead directory. `beadsync` auto-reads the project name
-from your Speckit export's `project.id` field, so IDs never collide across projects.
+Each project's Beads are namespaced by their `external_ref` (`speckit-<project>-<id>`), so task IDs never collide across projects. `beadsync` auto-reads the project name from your Speckit export's `project.id` field.
 
 ```bash
 # Project alpha
 cd ~/projects/alpha
-beadsync speckit-to-beads export.json --out ./beads
-beadsync sync ./beads --repo acme/alpha
+beadsync speckit-to-beads export.json
+beadsync sync --repo acme/alpha
 
 # Project beta — same task IDs, no collision
 cd ~/projects/beta
-beadsync speckit-to-beads export.json --out ./beads
-beadsync sync ./beads --repo acme/beta
+beadsync speckit-to-beads export.json
+beadsync sync --repo acme/beta
 ```
 
 To set the project name explicitly (useful if your export has no `project.id`):
@@ -170,15 +170,15 @@ beadsync speckit-to-beads export.json --project my-project-name
 ### Check sync state at any time
 
 ```bash
-beadsync status ./beads
+beadsync status
 ```
 
 ```
-Bead file                                  Status       GH Issue     Synced?
-──────────────────────────────────────────────────────────────────────────────
-bead-my-project-SPEC-001.json              closed       #12          up to date
-bead-my-project-SPEC-002.json              in_progress  #13          needs update
-bead-my-project-SPEC-003.json              open         #-           not synced
+Bead ID              Title                                            Status         GH Issue     Synced?
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+bd-a1b2              Set up monorepo structure                        closed         #12          up to date
+bd-c3d4              Implement Speckit JSON parser                    in_progress    #13          needs update
+bd-e5f6              Design Bead file schema                          open           #-           not synced
 
 Total: 3 | Synced: 1 | Needs sync: 2
 ```
@@ -186,7 +186,7 @@ Total: 3 | Synced: 1 | Needs sync: 2
 ### Ongoing sync — run whenever Beads change
 
 ```bash
-beadsync sync ./beads --repo acme/my-project
+beadsync sync --repo acme/my-project
 ```
 
 Re-running is fully idempotent: unchanged Beads are skipped, changed Beads are updated, no duplicates are ever created.
@@ -194,19 +194,18 @@ Re-running is fully idempotent: unchanged Beads are skipped, changed Beads are u
 ### Force-push all Beads (override manual GitHub edits)
 
 ```bash
-beadsync sync ./beads --repo acme/my-project --force
+beadsync sync --repo acme/my-project --force
 ```
 
 ### Full example with all options
 
 ```bash
 beadsync speckit-to-beads export.json \
-  --out ./beads \
   --project my-project \
   --dry-run \
   --verbose
 
-beadsync sync ./beads \
+beadsync sync \
   --repo acme/my-project \
   --force \
   --dry-run \
@@ -257,11 +256,11 @@ See [`examples/speckit_export.json`](examples/speckit_export.json) for a complet
 
 ## Field mapping
 
-### Speckit → Bead
+### Speckit → Bead (`bd`)
 
 | Speckit field | Bead field | Notes |
 |---|---|---|
-| `id` | `spec_id`, `external_id` | `external_id = "speckit-<project>-<id>"` |
+| `id` | `external_ref` | `"speckit-<project>-<id>"` — stable cross-system identity |
 | `title` | `title` | |
 | `description` | `description` | |
 | `acceptance_criteria` | `acceptance_criteria` | |
@@ -270,7 +269,7 @@ See [`examples/speckit_export.json`](examples/speckit_export.json) for a complet
 | `status` | `status` | `pending`→`open`, `done`→`closed`, etc. |
 | `type` | `issue_type` | `feature`→`feature`, `task`→`task`, etc. |
 | `assignee` | `assignee` | |
-| `labels[]` | `labels[]` | |
+| `labels[]` | `labels[]` | Always includes `speckit` as a base label |
 | `milestone` | `metadata.milestone` | Used for GitHub milestone lookup |
 | `estimated_hours` | `estimated_minutes` | Multiplied by 60 |
 | `due_date` | `due_at` | `T00:00:00Z` appended if date-only |
@@ -291,18 +290,18 @@ See [`examples/speckit_export.json`](examples/speckit_export.json) for a complet
 
 ## How idempotency works
 
-Every Bead contains two hashes in its `metadata`:
+Every Bead stores two hashes in its `metadata` (via `bd update --metadata`):
 
-- **`content_hash`** — SHA-256 of the Bead's key fields. Recomputed each time `speckit-to-beads` runs. If the source task hasn't changed, the Bead file is not touched.
+- **`content_hash`** — SHA-256 of the Bead's key fields. Recomputed each time `speckit-to-beads` runs. If the source task hasn't changed, the Bead is not touched.
 
 - **`github_issue_synced_hash`** — the `content_hash` at the time of the last successful GitHub sync. If these two hashes differ, the issue is updated on the next `sync` run.
 
-Every GitHub issue body contains a hidden HTML comment:
+Every GitHub issue body also contains a hidden HTML comment:
 ```html
 <!-- beadsync:external_id:speckit-my-project-SPEC-001 -->
 ```
 
-On `sync`, this anchor is used to find the matching issue so it's updated rather than recreated, even if the Bead file has been deleted and re-created from scratch.
+On `sync`, this anchor is used to find the matching issue so it is updated rather than recreated, even if the `bd` database is wiped and rebuilt from scratch.
 
 ---
 
@@ -327,7 +326,7 @@ On `sync`, this anchor is used to find the matching issue so it's updated rather
 ## Project structure
 
 ```
-beadsync                  ← the CLI script (single file, no dependencies beyond jq + gh)
+beadsync                  ← the CLI script (single file)
 examples/
   speckit_export.json     ← sample Speckit export with 6 tasks
 ```
