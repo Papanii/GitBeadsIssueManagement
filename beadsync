@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# beadsync — Speckit → Beads → GitHub Issues workflow bridge
-# Version  : 2.3.0
-# Requires : bash ≥ 4.3, jq, gh (GitHub CLI), bd (Beads CLI)
+# beadsync — spec-kit tasks.md → Beads → GitHub Issues workflow bridge
+# Version  : 3.0.0
+# Requires : bash ≥ 3.2, jq, gh (GitHub CLI), bd (Beads CLI)
 # =============================================================================
 # SOURCE OF TRUTH MODEL
-#   Phase 1 — Speckit is canonical.  Run: speckit-to-beads
+#   Phase 1 — spec-kit is canonical.  Run: /speckit.tasks → generates tasks.md
+#              Then: beadsync speckit-to-beads  (auto-reads .specify/specs/*/tasks.md)
 #   Phase 2 — Beads are canonical.   Run: beads-to-gh / sync
 #   GitHub Issues are read-only projections of Beads.
 #   GitHub edits do NOT flow back into Beads unless --force is used.
@@ -14,7 +15,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="2.3.0"
+VERSION="3.0.0"
 
 # ---------------------------------------------------------------------------
 # Colours (disabled when not a TTY)
@@ -194,6 +195,16 @@ map_type() {
   esac
 }
 
+# spec-kit user story number → Bead priority (US1=P1/high … none=P2/medium)
+map_us_priority() {
+  case "$1" in
+    US1)          echo 1 ;;
+    US2)          echo 2 ;;
+    US[3-9]|US1[0-9]*) echo 3 ;;
+    *)            echo 2 ;;   # setup / foundational / polish
+  esac
+}
+
 # =============================================================================
 # BEAD IDENTITY
 # =============================================================================
@@ -216,8 +227,7 @@ compute_content_hash() {
   local hash_json="$1"
   local canonical
   canonical=$(printf '%s' "$hash_json" | jq -c '{
-    title, description, acceptance_criteria, notes,
-    status, priority, issue_type, assignee, labels, due_at
+    title, status, priority, issue_type, labels
   }')
   sha256_of "$canonical"
 }
@@ -257,202 +267,152 @@ bd_json_to_internal() {
 }
 
 # =============================================================================
-# SPECKIT → BEADS  (Phase 1)
+# SPEC-KIT tasks.md → BEADS  (Phase 1)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# Speckit export JSON schema (assumed):
-# {
-#   "export_version": "1.0",        // optional
-#   "exported_at":    "<ISO8601>",   // optional
-#   "project": { "id": "...", "name": "..." },  // optional
-#   "tasks": [
-#     {
-#       "id":                   "<string>",   // REQUIRED — unique stable ID
-#       "title":                "<string>",   // REQUIRED
-#       "description":          "<string>",   // optional
-#       "acceptance_criteria":  "<string>",   // optional
-#       "notes":                "<string>",   // optional
-#       "priority":             "<string>",   // optional: critical|high|medium|low|none
-#       "status":               "<string>",   // optional: pending|in_progress|done|blocked|deferred|cancelled
-#       "type":                 "<string>",   // optional: task|bug|feature|epic|chore|decision
-#       "assignee":             "<string>",   // optional: GitHub username
-#       "labels":               ["<string>"], // optional
-#       "milestone":            "<string>",   // optional
-#       "estimated_hours":      <number>,     // optional
-#       "due_date":             "<YYYY-MM-DD>",// optional
-#       "parent_id":            "<string>",   // optional — Speckit ID of parent task
-#       "created_at":           "<ISO8601>",  // optional
-#       "updated_at":           "<ISO8601>"   // optional
-#     }
-#   ]
-# }
+# spec-kit tasks.md line format:
+#   - [ ] T001 Description with file path
+#   - [ ] T005 [P] Implement auth middleware in src/middleware/auth.py
+#   - [x] T012 [P] [US1] Create User model in src/models/user.py
+#   - [ ] T014 [US1] Implement UserService in src/services/user_service.py
+#
+# Components:
+#   - [ ] or - [x]  checkbox (open / closed)
+#   T\d+            task ID  (T001, T002, …)
+#   [P]             optional — task is parallelisable
+#   [US\d+]         optional — maps to user story (US1, US2, …)
+#   rest of line    description / title
+#
+# All other lines (headers, blank lines, comments, dependency sections) are
+# silently skipped.
+#
+# Auto-discovery: .specify/specs/*/tasks.md (relative to CWD).
+# Project ID per file: folder name with leading NNN- stripped and normalised.
 # ---------------------------------------------------------------------------
 
-cmd_speckit_to_beads() {
-  local speckit_file=""
-  local project_id_flag=""
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --project|-p)   project_id_flag="$2"; shift 2 ;;
-      --dry-run)      DRY_RUN=true;         shift ;;
-      --verbose|-v)   VERBOSE=true;         shift ;;
-      -*)             die "Unknown option: $1" ;;
-      *)
-        [[ -z "$speckit_file" ]] && speckit_file="$1"
-        shift ;;
-    esac
-  done
-
-  [[ -n "$speckit_file" ]] || die_usage "Usage: beadsync speckit-to-beads <speckit_export.json> [--project ID]"
-  require_file "$speckit_file"
-  validate_json_file "$speckit_file"
-
-  [[ "$DRY_RUN" != true ]] && check_bd_dep
-  [[ "$DRY_RUN" != true ]] && check_bd_init
-  [[ "$DRY_RUN" != true ]] && check_bd_stale
-
-  # Validate that .tasks is an array
-  local tasks_type task_count
-  tasks_type=$(jq -r '.tasks | type' "$speckit_file" 2>/dev/null) \
-    || die "Invalid Speckit JSON: cannot parse file"
-  [[ "$tasks_type" == "array" ]] \
-    || die "Invalid Speckit JSON: '.tasks' must be an array (got: ${tasks_type:-missing})"
-  task_count=$(jq '.tasks | length' "$speckit_file")
-
-  # Resolve project ID: --project flag > export's project.id > export's project.name > filename stem
-  local project_id
-  if [[ -n "$project_id_flag" ]]; then
-    project_id="$project_id_flag"
-  else
-    project_id=$(jq -r '.project.id // .project.name // ""' "$speckit_file")
-    if [[ -z "$project_id" ]]; then
-      project_id=$(basename "$speckit_file" .json)
-      log_warn "No project.id in export — using filename as project ID: $project_id"
-      log_warn "Use --project <id> to set an explicit project ID."
-    fi
-  fi
-
-  # Normalise: lowercase, collapse non-alphanumeric runs to single dash, trim edges
-  project_id=$(printf '%s' "$project_id" \
+# Derive a normalised project ID from a spec-kit feature folder name.
+# Input:  ".specify/specs/001-my-feature"  or  "my-feature"
+# Output: "my-feature"
+_project_id_from_folder() {
+  local folder
+  folder=$(basename "$1")
+  # Strip leading NNN- numeric prefix (e.g. "001-")
+  folder=$(printf '%s' "$folder" | sed 's/^[0-9]*-//')
+  # Normalise: lowercase, collapse non-alnum runs to dash, trim edges
+  printf '%s' "$folder" \
     | tr '[:upper:]' '[:lower:]' \
     | tr -cs 'a-z0-9' '-' \
-    | sed 's/^-//;s/-$//')
+    | sed 's/^-//;s/-$//'
+}
 
-  log_info "Speckit export : $speckit_file"
-  log_info "Project ID     : $project_id"
-  log_info "Tasks found    : $task_count"
-  [[ "$DRY_RUN" == true ]] && log_warn "Dry-run mode — no beads will be created or updated"
+_process_tasks_file() {
+  local tasks_file="$1"
+  local project_id="$2"
 
-  local created=0 updated=0 skipped=0 failed=0
+  local created=0 updated=0 skipped=0 failed=0 task_count=0
 
-  # Pre-fetch the full list once so idempotency lookups are O(1) instead of O(n).
+  log_info "tasks.md     : $tasks_file"
+  log_info "Project ID   : $project_id"
+
+  # Pre-fetch the full speckit bead list once for O(1) idempotency lookups.
   local _all_beads_json=""
   [[ "$DRY_RUN" != true ]] && \
     _all_beads_json=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
 
-  while IFS= read -r task_json; do
+  while IFS= read -r line; do
 
-    # ---- Required fields ---------------------------------------------------
-    local speckit_id title
-    speckit_id=$(printf '%s' "$task_json" | jq -r '.id // empty')
-    if [[ -z "$speckit_id" ]]; then
-      log_warn "Skipping task with no 'id' field"
-      (( failed++ )); continue
+    # Match checklist lines only: - [ ] T001 ... or - [x] T001 ...
+    [[ "$line" =~ ^[[:space:]]*-[[:space:]]\[([[:space:]x])\][[:space:]]+(T[0-9]+)(.*) ]] \
+      || continue
+
+    local checked="${BASH_REMATCH[1]}"
+    local task_id="${BASH_REMATCH[2]}"
+    local rest="${BASH_REMATCH[3]}"
+
+    # Markers [P] and [US\d+] always appear immediately after the task ID,
+    # before the description.  Parse positionally from the left so that [P]
+    # inside description text (e.g. "(ID, [P], [US#], status)") is ignored.
+
+    # Trim leading whitespace first
+    rest=$(printf '%s' "$rest" | sed 's/^[[:space:]]*//')
+
+    # Extract optional [P] parallelism marker (only if at start of rest)
+    local parallel=false
+    if printf '%s' "$rest" | grep -qE '^\[P\]([[:space:]]|$)'; then
+      parallel=true
+      rest=$(printf '%s' "$rest" | sed 's/^\[P\][[:space:]]*//')
     fi
 
-    title=$(printf '%s' "$task_json" | jq -r '.title // empty')
+    # Extract optional [US\d+] user-story marker (only if at start of rest)
+    local user_story=""
+    if printf '%s' "$rest" | grep -qE '^\[US[0-9]+\]([[:space:]]|$)'; then
+      user_story=$(printf '%s' "$rest" | grep -oE '^\[US[0-9]+\]' | tr -d '[]' || true)
+      rest=$(printf '%s' "$rest" | sed 's/^\[US[0-9]*\][[:space:]]*//')
+    fi
+
+    # Trim whitespace from description
+    local title
+    title=$(printf '%s' "$rest" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
     if [[ -z "$title" ]]; then
-      log_warn "Skipping task $speckit_id: no 'title' field"
-      (( failed++ )); continue
+      log_warn "Skipping $task_id: empty description"
+      failed=$(( failed + 1 )); continue
     fi
 
-    # ---- Optional fields ---------------------------------------------------
-    local description acc_criteria notes assignee milestone
-    local estimated_hours due_date parent_id raw_status
-    description=$(printf '%s'     "$task_json" | jq -r '.description          // ""')
-    acc_criteria=$(printf '%s'    "$task_json" | jq -r '.acceptance_criteria  // ""')
-    notes=$(printf '%s'           "$task_json" | jq -r '.notes                // ""')
-    assignee=$(printf '%s'        "$task_json" | jq -r '.assignee             // ""')
-    milestone=$(printf '%s'       "$task_json" | jq -r '.milestone            // ""')
-    estimated_hours=$(printf '%s' "$task_json" | jq -r '.estimated_hours      // 0')
-    due_date=$(printf '%s'        "$task_json" | jq -r '.due_date             // ""')
-    parent_id=$(printf '%s'       "$task_json" | jq -r '.parent_id            // ""')
-    raw_status=$(printf '%s'      "$task_json" | jq -r '.status               // "pending"')
+    task_count=$(( task_count + 1 ))
 
-    # ---- Mapped fields -----------------------------------------------------
-    local bead_status bead_priority bead_type close_reason
-    bead_status=$(map_status   "$(printf '%s' "$task_json" | jq -r '.status   // "pending"')")
-    bead_priority=$(map_priority "$(printf '%s' "$task_json" | jq -r '.priority // "medium"')")
-    bead_type=$(map_type       "$(printf '%s' "$task_json" | jq -r '.type     // "task"')")
-    close_reason=$(map_close_reason "$raw_status")
+    # ---- Map fields --------------------------------------------------------
+    local bead_status bead_priority
+    [[ "$checked" == "x" ]] && bead_status="closed" || bead_status="open"
+    bead_priority=$(map_us_priority "$user_story")
 
-    # estimated_minutes (integer arithmetic, avoid bc dependency)
-    local estimated_minutes=0
-    if [[ "$estimated_hours" != "0" && -n "$estimated_hours" ]]; then
-      local eh_int
-      eh_int=$(printf '%.0f' "$estimated_hours" 2>/dev/null || printf '%s' "$estimated_hours" | cut -d. -f1)
-      estimated_minutes=$(( eh_int * 60 ))
-    fi
+    # Labels: speckit (always) + user story (if any) + parallel (if flagged)
+    local all_labels="speckit"
+    [[ -n "$user_story" ]] && all_labels+=",$user_story"
+    [[ "$parallel" == true ]] && all_labels+=",parallel"
 
-    # due_at — append T00:00:00Z if only a date was provided
-    local due_at=""
-    if [[ -n "$due_date" ]]; then
-      [[ "$due_date" =~ T ]] && due_at="$due_date" || due_at="${due_date}T00:00:00Z"
-    fi
+    local labels_json
+    labels_json=$(printf '%s' "$all_labels" | tr ',' '\n' \
+      | jq -Rc '[inputs | select(length > 0)]')
 
-    # Labels: always include "speckit" as the base label for filtering,
-    # plus any labels from the Speckit task
-    local labels_json extra_labels all_labels
-    labels_json=$(printf '%s' "$task_json" | jq -c '.labels // []')
-    extra_labels=$(printf '%s' "$task_json" | jq -r '.labels // [] | .[]' 2>/dev/null)
-    all_labels="speckit"
-    while IFS= read -r lbl; do
-      [[ -n "$lbl" ]] && all_labels+=",$lbl"
-    done <<< "$extra_labels"
-
-    # ---- Content hash (hashes key fields, excludes sync metadata) ----------
+    # ---- Content hash ------------------------------------------------------
     local external_ref content_hash hash_json
-    external_ref=$(compute_external_ref "$project_id" "$speckit_id")
+    external_ref=$(compute_external_ref "$project_id" "$task_id")
     hash_json=$(jq -cn \
-      --arg  title              "$title" \
-      --arg  description        "$description" \
-      --arg  acceptance_criteria "$acc_criteria" \
-      --arg  notes              "$notes" \
-      --arg  status             "$bead_status" \
-      --argjson priority        "$bead_priority" \
-      --arg  issue_type         "$bead_type" \
-      --arg  assignee           "$assignee" \
-      --argjson labels          "$labels_json" \
-      --arg  due_at             "$due_at" \
-      '{title, description, acceptance_criteria, notes,
-        status, priority, issue_type, assignee, labels, due_at}')
+      --arg  title      "$title" \
+      --arg  status     "$bead_status" \
+      --argjson priority "$bead_priority" \
+      --arg  issue_type "task" \
+      --argjson labels  "$labels_json" \
+      '{title, status, priority, issue_type, labels}')
     content_hash=$(compute_content_hash "$hash_json")
 
-    log_debug "Processing $speckit_id → external_ref: $external_ref"
+    log_debug "Processing $task_id → external_ref: $external_ref"
 
-    # ---- Idempotency: check for existing bead in bd (uses pre-fetched list) --
+    # ---- Idempotency: check for existing bead in bd ------------------------
     local bd_id=""
     [[ "$DRY_RUN" != true ]] && bd_id=$(printf '%s' "$_all_beads_json" \
       | jq -r --arg ref "$external_ref" '.[]? | select(.external_ref == $ref) | .id' \
       | head -1)
 
-    # ---- Base metadata (shared by create and update) -----------------------
+    # ---- Base metadata -----------------------------------------------------
+    local parallel_bool="false"
+    [[ "$parallel" == true ]] && parallel_bool="true"
+
     local base_meta_json
     base_meta_json=$(jq -cn \
-      --arg ch  "$content_hash" \
-      --arg sid "$speckit_id" \
-      --arg ms  "$milestone" \
-      --arg pid "$parent_id" \
-      --arg cr  "$close_reason" \
+      --arg  ch  "$content_hash" \
+      --arg  tid "$task_id" \
+      --arg  us  "$user_story" \
+      --argjson p "$parallel_bool" \
       '{
-        source_system:     "speckit",
-        speckit_id:        $sid,
-        content_hash:      $ch,
-        milestone:         (if $ms  != "" then $ms  else null end),
-        parent_speckit_id: (if $pid != "" then $pid else null end),
-        close_reason:      (if $cr  != "" then $cr  else null end)
+        source_system: "speckit",
+        speckit_id:    $tid,
+        task_id:       $tid,
+        content_hash:  $ch,
+        user_story:    (if $us != "" then $us else null end),
+        parallel:      $p
       } | with_entries(select(.value != null))')
 
     # ========================================================================
@@ -461,44 +421,40 @@ cmd_speckit_to_beads() {
     if [[ -z "$bd_id" ]]; then
 
       if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would create bead: [$bead_type / P${bead_priority}] $title  ($external_ref)"
-        (( created++ )); continue
+        local us_tag=""
+        [[ -n "$user_story" ]] && us_tag=" [$user_story]"
+        [[ "$parallel" == true ]] && us_tag+=" [P]"
+        log_dry "Would create: [$task_id / P${bead_priority}${us_tag}] $title"
+        created=$(( created + 1 )); continue
       fi
 
-      log_info "Creating bead: $title  ($external_ref)"
+      log_info "Creating bead: $task_id — $title"
 
       local create_args=("$title")
       create_args+=(--external-ref "$external_ref")
       create_args+=(-l "$all_labels")
       create_args+=(-p "$bead_priority")
-      create_args+=(-t "$bead_type")
+      create_args+=(-t "task")
       create_args+=(--silent)
-      [[ -n "$description" ]]  && create_args+=(-d "$description")
-      [[ -n "$acc_criteria" ]] && create_args+=(--acceptance "$acc_criteria")
-      [[ -n "$notes" ]]        && create_args+=(--notes "$notes")
-      [[ -n "$assignee" ]]     && create_args+=(-a "$assignee")
-      [[ -n "$due_at" ]]       && create_args+=(--due "$due_at")
-      [[ "$estimated_minutes" -gt 0 ]] && create_args+=(-e "$estimated_minutes")
 
       local new_bd_id
       if ! new_bd_id=$(bd create "${create_args[@]}" 2>/dev/null); then
-        log_error "Failed to create bead for $speckit_id"
-        (( failed++ )); continue
+        log_error "Failed to create bead for $task_id"
+        failed=$(( failed + 1 )); continue
       fi
       new_bd_id=$(printf '%s' "$new_bd_id" | tr -d '[:space:]')
 
-      # Set non-open status (bd create always starts as open)
-      if [[ "$bead_status" != "open" ]]; then
-        bd update "$new_bd_id" -s "$bead_status" -q 2>/dev/null \
-          || log_warn "Could not set status '$bead_status' on $new_bd_id"
+      # Set closed status if task was already checked off
+      if [[ "$bead_status" == "closed" ]]; then
+        bd update "$new_bd_id" -s "closed" -q 2>/dev/null \
+          || log_warn "Could not set status 'closed' on $new_bd_id"
       fi
 
-      # Store metadata (content_hash + speckit fields; no GitHub fields yet)
       bd update "$new_bd_id" --metadata "$base_meta_json" -q 2>/dev/null \
         || log_warn "Could not set metadata on $new_bd_id"
 
       log_info "  Created: $new_bd_id"
-      (( created++ ))
+      created=$(( created + 1 ))
 
     else
     # ========================================================================
@@ -512,7 +468,7 @@ cmd_speckit_to_beads() {
 
       if [[ "$existing_hash" == "$content_hash" ]]; then
         log_debug "Bead $external_ref unchanged — skipped"
-        (( skipped++ )); continue
+        skipped=$(( skipped + 1 )); continue
       fi
 
       log_info "Updating bead: $bd_id  ($external_ref)"
@@ -520,20 +476,14 @@ cmd_speckit_to_beads() {
       local update_args=("$bd_id")
       update_args+=(--title "$title")
       update_args+=(-p "$bead_priority")
-      update_args+=(-t "$bead_type")
+      update_args+=(-t "task")
       update_args+=(-s "$bead_status")
       update_args+=(--set-labels "$all_labels")
-      [[ -n "$description" ]]  && update_args+=(-d "$description")
-      [[ -n "$acc_criteria" ]] && update_args+=(--acceptance "$acc_criteria")
-      [[ -n "$notes" ]]        && update_args+=(--notes "$notes")
-      [[ -n "$assignee" ]]     && update_args+=(-a "$assignee")
-      [[ -n "$due_at" ]]       && update_args+=(--due "$due_at")
-      [[ "$estimated_minutes" -gt 0 ]] && update_args+=(-e "$estimated_minutes")
       update_args+=(-q)
 
       if ! bd update "${update_args[@]}" 2>/dev/null; then
         log_error "Failed to update bead $bd_id"
-        (( failed++ )); continue
+        failed=$(( failed + 1 )); continue
       fi
 
       # Preserve existing GitHub sync fields when rebuilding metadata
@@ -553,7 +503,6 @@ cmd_speckit_to_beads() {
         (if $ghs  != "" then {github_issue_synced_at:   $ghs}  else {} end) +
         (if $ghsh != "" then {github_issue_synced_hash: $ghsh} else {} end)')
 
-      # github_issue_number is a number — inject separately to keep type correct
       if [[ -n "$gh_num" && "$gh_num" != "null" ]]; then
         full_meta_json=$(printf '%s' "$full_meta_json" \
           | jq -c --argjson n "$gh_num" '. + {github_issue_number: $n}')
@@ -563,19 +512,80 @@ cmd_speckit_to_beads() {
         || log_warn "Could not update metadata on $bd_id"
 
       log_info "  Updated: $bd_id"
-      (( updated++ ))
+      updated=$(( updated + 1 ))
     fi
 
-  done < <(jq -c '.tasks[]' "$speckit_file")
+  done < "$tasks_file"
 
   printf '\n'
-  log_info "speckit-to-beads complete — created: $created, updated: $updated, skipped: $skipped, failed: $failed"
+  log_info "  Tasks parsed : $task_count  |  created: $created, updated: $updated, skipped: $skipped, failed: $failed"
+
+  # Return counters via globals so caller can accumulate across files
+  _S2B_CREATED=$(( _S2B_CREATED + created ))
+  _S2B_UPDATED=$(( _S2B_UPDATED + updated ))
+  _S2B_FAILED=$((  _S2B_FAILED  + failed  ))
+}
+
+# Global accumulators for _process_tasks_file
+_S2B_CREATED=0
+_S2B_UPDATED=0
+_S2B_FAILED=0
+
+cmd_speckit_to_beads() {
+  local project_id_flag=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project|-p)   project_id_flag="$2"; shift 2 ;;
+      --dry-run)      DRY_RUN=true;         shift ;;
+      --verbose|-v)   VERBOSE=true;         shift ;;
+      -*)             die "Unknown option: $1" ;;
+      *)              die_usage "speckit-to-beads takes no positional arguments — tasks.md files are auto-discovered under .specify/specs/" ;;
+    esac
+  done
+
+  [[ "$DRY_RUN" != true ]] && check_bd_dep
+  [[ "$DRY_RUN" != true ]] && check_bd_init
+  [[ "$DRY_RUN" != true ]] && check_bd_stale
+
+  # Discover all tasks.md files under .specify/specs/*/
+  local tasks_files=()
+  while IFS= read -r f; do
+    [[ -f "$f" ]] && tasks_files+=("$f")
+  done < <(find .specify/specs -mindepth 2 -maxdepth 2 -name tasks.md 2>/dev/null | sort)
+
+  if [[ ${#tasks_files[@]} -eq 0 ]]; then
+    die "No tasks.md files found under .specify/specs/." \
+        $'\n       ''Run /speckit.tasks to generate a tasks.md first.'
+  fi
+
+  # --project only makes sense when there is exactly one file
+  if [[ -n "$project_id_flag" && ${#tasks_files[@]} -gt 1 ]]; then
+    die "--project can only be used when there is a single tasks.md (found ${#tasks_files[@]})"
+  fi
+
+  log_info "Found ${#tasks_files[@]} tasks.md file(s)"
+  [[ "$DRY_RUN" == true ]] && log_warn "Dry-run mode — no beads will be created or updated"
+
+  _S2B_CREATED=0; _S2B_UPDATED=0; _S2B_FAILED=0
+
+  local f project_id
+  for f in "${tasks_files[@]}"; do
+    if [[ -n "$project_id_flag" ]]; then
+      project_id="$project_id_flag"
+    else
+      project_id=$(_project_id_from_folder "$(dirname "$f")")
+    fi
+    _process_tasks_file "$f" "$project_id"
+  done
+
+  printf '\n'
+  log_info "speckit-to-beads complete — created: $_S2B_CREATED, updated: $_S2B_UPDATED, failed: $_S2B_FAILED"
   [[ "$DRY_RUN" == true ]] && log_warn "Dry-run — no beads were created or updated."
 
-  # Keep .beads/issues.jsonl current so it can be committed to git
-  [[ $(( created + updated )) -gt 0 ]] && bd_export_jsonl
+  [[ $(( _S2B_CREATED + _S2B_UPDATED )) -gt 0 ]] && bd_export_jsonl
 
-  [[ $failed -eq 0 ]] || return 1
+  [[ $_S2B_FAILED -eq 0 ]] || return 1
 }
 
 # =============================================================================
@@ -589,45 +599,66 @@ cmd_speckit_to_beads() {
 format_gh_body() {
   local bead_json="$1"
 
-  local title description acc_criteria notes spec_id external_id
-  local due_at assignee estimated_minutes issue_type priority milestone
-  title=$(printf '%s'             "$bead_json" | jq -r '.title                // ""')
-  description=$(printf '%s'       "$bead_json" | jq -r '.description          // ""')
-  acc_criteria=$(printf '%s'      "$bead_json" | jq -r '.acceptance_criteria  // ""')
-  notes=$(printf '%s'             "$bead_json" | jq -r '.notes                // ""')
-  spec_id=$(printf '%s'           "$bead_json" | jq -r '.spec_id              // ""')
-  external_id=$(printf '%s'       "$bead_json" | jq -r '.external_id          // ""')
-  due_at=$(printf '%s'            "$bead_json" | jq -r '.due_at               // ""')
-  assignee=$(printf '%s'          "$bead_json" | jq -r '.assignee             // ""')
-  estimated_minutes=$(printf '%s' "$bead_json" | jq -r '.estimated_minutes    // 0')
-  issue_type=$(printf '%s'        "$bead_json" | jq -r '.issue_type           // "task"')
-  priority=$(printf '%s'          "$bead_json" | jq -r '.priority             // 2')
-  milestone=$(printf '%s'         "$bead_json" | jq -r '.metadata.milestone   // ""')
+  local task_id external_id title priority
+  task_id=$(printf '%s'    "$bead_json" | jq -r '.metadata.task_id  // ""')
+  external_id=$(printf '%s' "$bead_json" | jq -r '.external_id       // ""')
+  title=$(printf '%s'      "$bead_json" | jq -r '.title              // ""')
+  priority=$(printf '%s'   "$bead_json" | jq -r '.priority           // 2')
 
   local body=""
 
-  [[ -n "$description" ]]  && body+="## Description\n\n${description}\n\n"
-  [[ -n "$acc_criteria" ]] && body+="## Acceptance Criteria\n\n${acc_criteria}\n\n"
-  [[ -n "$notes" ]]        && body+="## Notes\n\n${notes}\n\n"
+  # spec-kit task bead — task_id is the primary identifier
+  if [[ -n "$task_id" ]]; then
+    local user_story parallel
+    user_story=$(printf '%s' "$bead_json" | jq -r '.metadata.user_story // ""')
+    parallel=$(printf '%s'   "$bead_json" | jq -r '.metadata.parallel   // false')
 
-  # Metadata table
-  body+="---\n\n"
-  body+="| Field | Value |\n"
-  body+="| --- | --- |\n"
-  body+="| Speckit ID | \`${spec_id}\` |\n"
-  body+="| Issue type | \`${issue_type}\` |\n"
-  body+="| Priority | P${priority} |\n"
-  [[ -n "$due_at"    ]] && body+="| Due date | \`${due_at}\` |\n"
-  [[ -n "$milestone" ]] && body+="| Milestone | ${milestone} |\n"
-  [[ -n "$assignee"  ]] && body+="| Assignee | @${assignee} |\n"
+    local summary="\`${task_id}\`"
+    [[ -n "$user_story"      ]] && summary+=" · User Story: ${user_story}"
+    [[ "$parallel" == "true" ]] && summary+=" · Parallel: yes"
 
-  if [[ "$estimated_minutes" -gt 0 ]]; then
-    local h=$(( estimated_minutes / 60 ))
-    local m=$(( estimated_minutes % 60 ))
-    local est=""
-    [[ $h -gt 0 ]] && est+="${h}h"
-    [[ $m -gt 0 ]] && est+=" ${m}m"
-    body+="| Estimate | \`${est}\` |\n"
+    body+="## Task\n\n${summary}\n\n"
+    body+="---\n\n"
+    body+="| Field | Value |\n"
+    body+="| --- | --- |\n"
+    body+="| Task ID | \`${task_id}\` |\n"
+    [[ -n "$user_story"      ]] && body+="| User Story | \`${user_story}\` |\n"
+    body+="| Priority | P${priority} |\n"
+    [[ "$parallel" == "true" ]] && body+="| Parallel | yes |\n"
+
+  else
+    # Legacy / non-task bead
+    local description acc_criteria notes spec_id due_at assignee estimated_minutes milestone
+    description=$(printf '%s'       "$bead_json" | jq -r '.description          // ""')
+    acc_criteria=$(printf '%s'      "$bead_json" | jq -r '.acceptance_criteria  // ""')
+    notes=$(printf '%s'             "$bead_json" | jq -r '.notes                // ""')
+    spec_id=$(printf '%s'           "$bead_json" | jq -r '.spec_id              // ""')
+    due_at=$(printf '%s'            "$bead_json" | jq -r '.due_at               // ""')
+    assignee=$(printf '%s'          "$bead_json" | jq -r '.assignee             // ""')
+    estimated_minutes=$(printf '%s' "$bead_json" | jq -r '.estimated_minutes    // 0')
+    milestone=$(printf '%s'         "$bead_json" | jq -r '.metadata.milestone   // ""')
+
+    [[ -n "$description" ]]  && body+="## Description\n\n${description}\n\n"
+    [[ -n "$acc_criteria" ]] && body+="## Acceptance Criteria\n\n${acc_criteria}\n\n"
+    [[ -n "$notes" ]]        && body+="## Notes\n\n${notes}\n\n"
+
+    body+="---\n\n"
+    body+="| Field | Value |\n"
+    body+="| --- | --- |\n"
+    [[ -n "$spec_id" ]]  && body+="| Speckit ID | \`${spec_id}\` |\n"
+    body+="| Priority | P${priority} |\n"
+    [[ -n "$due_at"    ]] && body+="| Due date | \`${due_at}\` |\n"
+    [[ -n "$milestone" ]] && body+="| Milestone | ${milestone} |\n"
+    [[ -n "$assignee"  ]] && body+="| Assignee | @${assignee} |\n"
+
+    if [[ "$estimated_minutes" -gt 0 ]]; then
+      local h=$(( estimated_minutes / 60 ))
+      local m=$(( estimated_minutes % 60 ))
+      local est=""
+      [[ $h -gt 0 ]] && est+="${h}h"
+      [[ $m -gt 0 ]] && est+=" ${m}m"
+      body+="| Estimate | \`${est}\` |\n"
+    fi
   fi
 
   body+="\n_Managed by [beadsync](https://github.com/steveyegge/beads). "
@@ -1090,22 +1121,22 @@ cmd_status() {
 
 show_usage() {
   cat <<EOF
-${BOLD}beadsync${RESET} v${VERSION}  —  Speckit → Beads → GitHub Issues
+${BOLD}beadsync${RESET} v${VERSION}  —  spec-kit tasks.md → Beads → GitHub Issues
 
 ${BOLD}USAGE${RESET}
   beadsync <command> [options]
 
 ${BOLD}COMMANDS${RESET}
 
-  ${CYAN}speckit-to-beads${RESET}  <speckit.json>  [--project ID]
-    Convert a Speckit JSON export into Beads using bd.
-    Each task is created or updated as a real Bead in the local bd database,
-    tagged with the 'speckit' label for downstream filtering.
+  ${CYAN}speckit-to-beads${RESET}  [--project ID]
+    Read all tasks.md files under .specify/specs/*/tasks.md (auto-discovered)
+    and create or update Beads in the local bd database.
+    Each task line becomes a Bead tagged with label 'speckit'.
+    Project ID is derived from the spec folder name (e.g. 001-my-feature → my-feature).
     Idempotent: re-running updates only changed tasks.
 
-      --project, -p ID Project identifier used to namespace Bead external refs.
-                       Auto-read from export's project.id field; falls
-                       back to the filename stem if absent.
+      --project, -p ID Override the project ID used to namespace Bead external
+                       refs.  Only valid when a single tasks.md is found.
       --dry-run        Preview without calling bd
       --verbose, -v    Verbose output
 
@@ -1132,7 +1163,7 @@ ${BOLD}ENVIRONMENT VARIABLES${RESET}
 
 ${BOLD}DEPENDENCIES${RESET}
 
-  Required: bash ≥ 4.3, jq, gh (GitHub CLI), bd (Beads CLI)
+  Required: bash ≥ 3.2, jq, gh (GitHub CLI), bd (Beads CLI)
   macOS:    shasum (built-in)  or  sha256sum
 
   Install: brew install jq gh
@@ -1153,7 +1184,7 @@ ${BOLD}TEAM WORKFLOW (multi-machine)${RESET}
   Workflow for each team member:
     git pull
     bd import -i .beads/issues.jsonl   ← rebuild local Dolt DB
-    beadsync speckit-to-beads ...      ← creates/updates beads + auto-exports
+    beadsync speckit-to-beads          ← creates/updates beads + auto-exports
     beadsync sync --repo ...           ← pushes to GitHub   + auto-exports
     git add .beads/issues.jsonl && git commit && git push
 
@@ -1165,10 +1196,11 @@ ${BOLD}EXIT CODES${RESET}
 
 ${BOLD}EXAMPLES${RESET}
 
-  # Phase 1 — convert Speckit tasks to Beads in bd
-  ./beadsync speckit-to-beads speckit_export.json
-  ./beadsync speckit-to-beads speckit_export.json --dry-run
-  ./beadsync speckit-to-beads speckit_export.json --project myproject
+  # Phase 1 — run /speckit.tasks first to generate .specify/specs/*/tasks.md
+  # then import all tasks into bd:
+  ./beadsync speckit-to-beads
+  ./beadsync speckit-to-beads --dry-run
+  ./beadsync speckit-to-beads --project myproject   # single spec only
 
   # Phase 2a — push all Beads to GitHub Issues (first time)
   ./beadsync beads-to-gh --repo acme/my-project --dry-run
@@ -1185,12 +1217,13 @@ ${BOLD}EXAMPLES${RESET}
 
 ${BOLD}SOURCE OF TRUTH MODEL${RESET}
 
-  1. Speckit is canonical until Beads are created in bd.
-  2. After Beads exist in bd, Beads are the source of truth.
-  3. GitHub Issues are read-only projections of Beads.
-  4. GitHub edits do NOT override Beads (unless --force is used).
-  5. Changes flow:
-       Phase 1:  Speckit → beadsync speckit-to-beads → bd (Bead database)
+  1. spec-kit /speckit.tasks generates .specify/specs/*/tasks.md
+  2. beadsync speckit-to-beads reads those files and creates Beads in bd.
+  3. After Beads exist in bd, Beads are the source of truth.
+  4. GitHub Issues are read-only projections of Beads.
+  5. GitHub edits do NOT override Beads (unless --force is used).
+  6. Changes flow:
+       Phase 1:  /speckit.tasks → tasks.md → beadsync speckit-to-beads → bd
        Phase 2:  bd Beads → beadsync sync → GitHub Issues
 
 EOF
