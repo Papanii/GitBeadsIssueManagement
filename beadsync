@@ -287,17 +287,13 @@ bd_json_to_internal() {
 # All other lines (headers, blank lines, comments, dependency sections) are
 # silently skipped.
 #
-# Auto-discovery (relative to CWD, checked in order):
-#   1. specs/*/tasks.md            ← spec-kit default (git branch → specs/<branch>/)
-#   2. .specify/specs/*/tasks.md   ← alternate layout used by some setups
-# Duplicate paths (same resolved file) are de-duplicated before processing.
-# Within a run, idempotency is enforced by external_ref + content_hash so a
-# task that appears in both trees is created once and skipped on the second pass.
+# Auto-discovery: specs/*/tasks.md relative to CWD.
+# spec-kit places tasks.md at specs/<NNN-branch-name>/tasks.md in the repo root.
 # Project ID per file: folder name with leading NNN- stripped and normalised.
 # ---------------------------------------------------------------------------
 
 # Derive a normalised project ID from a spec-kit feature folder name.
-# Input:  "specs/001-my-feature"  or  ".specify/specs/001-my-feature"
+# Input:  "specs/001-my-feature"
 # Output: "my-feature"
 _project_id_from_folder() {
   local folder
@@ -545,7 +541,7 @@ cmd_speckit_to_beads() {
       --dry-run)      DRY_RUN=true;         shift ;;
       --verbose|-v)   VERBOSE=true;         shift ;;
       -*)             die "Unknown option: $1" ;;
-      *)              die_usage "speckit-to-beads takes no positional arguments — tasks.md files are auto-discovered under specs/ and .specify/specs/" ;;
+      *)              die_usage "speckit-to-beads takes no positional arguments — tasks.md files are auto-discovered under specs/" ;;
     esac
   done
 
@@ -553,26 +549,14 @@ cmd_speckit_to_beads() {
   [[ "$DRY_RUN" != true ]] && check_bd_init
   [[ "$DRY_RUN" != true ]] && check_bd_stale
 
-  # Discover tasks.md files from both known spec-kit layouts, deduplicated by
-  # resolved path so the same file is never processed twice in one run.
+  # Discover all tasks.md files under specs/*/  (spec-kit default layout)
   local tasks_files=()
-  local _seen_paths=""
   while IFS= read -r f; do
-    [[ -f "$f" ]] || continue
-    local rp
-    rp=$(cd "$(dirname "$f")" && pwd)/$(basename "$f")
-    # Skip if we've already added this resolved path
-    printf '%s\n' "$_seen_paths" | grep -qxF "$rp" && continue
-    _seen_paths="${_seen_paths}"$'\n'"$rp"
-    tasks_files+=("$f")
-  done < <(
-    { find specs          -mindepth 2 -maxdepth 2 -name tasks.md 2>/dev/null
-      find .specify/specs -mindepth 2 -maxdepth 2 -name tasks.md 2>/dev/null
-    } | sort
-  )
+    [[ -f "$f" ]] && tasks_files+=("$f")
+  done < <(find specs -mindepth 2 -maxdepth 2 -name tasks.md 2>/dev/null | sort)
 
   if [[ ${#tasks_files[@]} -eq 0 ]]; then
-    die "No tasks.md files found under specs/ or .specify/specs/." \
+    die "No tasks.md files found under specs/." \
         $'\n       ''Run /speckit.tasks to generate a tasks.md first.'
   fi
 
