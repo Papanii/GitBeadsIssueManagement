@@ -32,6 +32,7 @@ fi
 # ---------------------------------------------------------------------------
 DRY_RUN=false
 VERBOSE=false
+ALL_BEADS=false
 
 # =============================================================================
 # LOGGING
@@ -954,16 +955,20 @@ _run_gh_sync() {
   [[ "$DRY_RUN"      == true ]] && log_warn "Dry-run mode — no changes will be made"
   [[ "$force_update" == true ]] && log_warn "Force mode  — all issues will be updated"
 
-  # Fetch all beads tagged with 'speckit' from the bd database
+  # Fetch beads from the bd database (all beads or speckit-only depending on --all-beads)
   local beads_list
-  beads_list=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
+  if [[ "$ALL_BEADS" == true ]]; then
+    beads_list=$(bd list --all --limit 0 --json 2>/dev/null || true)
+  else
+    beads_list=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
+  fi
 
   if [[ -z "$beads_list" || "$beads_list" == "[]" || "$beads_list" == "null" ]]; then
     if [[ -f ".beads/issues.jsonl" ]]; then
       log_warn "bd database is empty but .beads/issues.jsonl exists."
       log_warn "Run: bd import -i .beads/issues.jsonl  then retry."
     else
-      log_warn "No beads with label 'speckit' found.  Run: beadsync speckit-to-beads first."
+      log_warn "No beads found.  Run: beadsync speckit-to-beads first."
     fi
     return 0
   fi
@@ -1018,6 +1023,7 @@ cmd_beads_to_gh() {
       --repo|-r)    repo="$2";        shift 2 ;;
       --force)      force_update=true; shift ;;
       --dry-run)    DRY_RUN=true;      shift ;;
+      --all-beads)  ALL_BEADS=true;    shift ;;
       --verbose|-v) VERBOSE=true;      shift ;;
       -*)           die "Unknown option: $1" ;;
       *)            die "Unexpected argument '$1'.  Note: a beads directory is no longer required — beads are read directly from bd." ;;
@@ -1038,6 +1044,7 @@ cmd_sync() {
       --repo|-r)    repo="$2";        shift 2 ;;
       --force)      force_update=true; shift ;;
       --dry-run)    DRY_RUN=true;      shift ;;
+      --all-beads)  ALL_BEADS=true;    shift ;;
       --verbose|-v) VERBOSE=true;      shift ;;
       -*)           die "Unknown option: $1" ;;
       *)            die "Unexpected argument '$1'.  Note: a beads directory is no longer required — beads are read directly from bd." ;;
@@ -1054,18 +1061,31 @@ cmd_sync() {
 # =============================================================================
 
 cmd_status() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all-beads)  ALL_BEADS=true;  shift ;;
+      --verbose|-v) VERBOSE=true;    shift ;;
+      -*)           die "Unknown option: $1" ;;
+      *)            break ;;
+    esac
+  done
+
   check_bd_dep
   check_bd_init
 
   local beads_list
-  beads_list=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
+  if [[ "$ALL_BEADS" == true ]]; then
+    beads_list=$(bd list --all --limit 0 --json 2>/dev/null || true)
+  else
+    beads_list=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
+  fi
 
   if [[ -z "$beads_list" || "$beads_list" == "[]" || "$beads_list" == "null" ]]; then
     if [[ -f ".beads/issues.jsonl" ]]; then
       log_warn "bd database is empty but .beads/issues.jsonl exists."
       log_warn "Run: bd import -i .beads/issues.jsonl  then try again."
     else
-      log_warn "No beads with label 'speckit' found.  Run: beadsync speckit-to-beads first."
+      log_warn "No beads found.  Run: beadsync speckit-to-beads first."
     fi
     return 0
   fi
@@ -1148,6 +1168,7 @@ ${BOLD}COMMANDS${RESET}
       --repo, -r REPO  GitHub repo, e.g. acme/my-project  (required)
       --force          Override GitHub edits; always push Bead content
       --dry-run        Preview without touching GitHub
+      --all-beads      Sync all beads regardless of label (default: speckit-labelled only)
       --verbose, -v    Verbose output
 
   ${CYAN}sync${RESET}  --repo owner/name
@@ -1157,6 +1178,9 @@ ${BOLD}COMMANDS${RESET}
 
   ${CYAN}status${RESET}
     Print a table of all Beads (label=speckit) and their GitHub sync state.
+
+      --all-beads      Include all beads regardless of label (default: speckit-labelled only)
+      --verbose, -v    Verbose output
 
 ${BOLD}ENVIRONMENT VARIABLES${RESET}
 

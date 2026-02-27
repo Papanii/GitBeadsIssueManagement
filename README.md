@@ -149,13 +149,14 @@ beadsync speckit-to-beads --project my-project
 beadsync beads-to-gh --repo owner/name [options]
 ```
 
-Reads all Beads tagged `speckit` from the local `bd` database and pushes them to GitHub Issues. Creates new issues for unsynced Beads and updates existing ones when content has changed. Manual edits to GitHub issues are preserved unless `--force` is used.
+Reads Beads from the local `bd` database and pushes them to GitHub Issues. By default only Beads tagged `speckit` are included; pass `--all-beads` to sync every Bead regardless of label. Creates new issues for unsynced Beads and updates existing ones when content has changed. Manual edits to GitHub issues are preserved unless `--force` is used.
 
 | Option | Default | Description |
 |---|---|---|
 | `--repo, -r REPO` | _(required)_ | GitHub repo, e.g. `acme/my-project` |
 | `--force` | off | Override manual GitHub edits; always push Bead content |
 | `--dry-run` | off | Preview without touching GitHub |
+| `--all-beads` | off | Sync all Beads regardless of label (default: `speckit`-labelled only) |
 | `--verbose, -v` | off | Print debug output |
 
 ---
@@ -173,10 +174,10 @@ Alias for `beads-to-gh`. Only pushes Beads whose content has changed since the l
 ### `status` — Show sync state of all Beads
 
 ```bash
-beadsync status
+beadsync status [--all-beads]
 ```
 
-Prints a table of every Bead (label=`speckit`) in the `bd` database with its status, GitHub issue number, and whether it needs syncing. Read-only — makes no changes.
+Prints a table of every Bead in the `bd` database with its status, GitHub issue number, and whether it needs syncing. By default only Beads tagged `speckit` are shown; pass `--all-beads` to include every Bead regardless of label. Read-only — makes no changes.
 
 **Example output:**
 
