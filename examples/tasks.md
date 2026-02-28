@@ -38,14 +38,14 @@ description: "Task list template for feature implementation"
 
 **Goal**: Read tasks.md from .specify/specs/ and create Beads in bd
 
-**Independent Test**: Run beadsync speckit-to-beads --dry-run and verify tasks are parsed correctly
+**Independent Test**: Run bdim speckit-to-beads --dry-run and verify tasks are parsed correctly
 
-- [ ] T006 [P] [US1] Implement tasks.md parser in beadsync
-- [ ] T007 [US1] Map task fields (ID, [P], [US#], status) to Bead fields in beadsync
-- [ ] T008 [US1] Implement bd create/update idempotency logic in beadsync
-- [ ] T009 [US1] Add auto-discovery of .specify/specs/*/tasks.md in beadsync
+- [ ] T006 [P] [US1] Implement tasks.md parser in bdim
+- [ ] T007 [US1] Map task fields (ID, [P], [US#], status) to Bead fields in bdim
+- [ ] T008 [US1] Implement bd create/update idempotency logic in bdim
+- [ ] T009 [US1] Add auto-discovery of .specify/specs/*/tasks.md in bdim
 
-**Checkpoint**: beadsync speckit-to-beads creates Beads from tasks.md
+**Checkpoint**: bdim speckit-to-beads creates Beads from tasks.md
 
 ---
 
@@ -53,14 +53,14 @@ description: "Task list template for feature implementation"
 
 **Goal**: Push Beads to GitHub Issues with idempotent sync
 
-**Independent Test**: Run beadsync sync --repo owner/repo --dry-run and verify issues would be created
+**Independent Test**: Run bdim sync --repo owner/repo --dry-run and verify issues would be created
 
-- [ ] T010 [P] [US2] Implement format_gh_body for task Beads in beadsync
-- [ ] T011 [US2] Implement _sync_one_bead create path in beadsync
-- [ ] T012 [US2] Implement _sync_one_bead update/skip path in beadsync
-- [ ] T013 [US2] Write back github_issue_number/url to Bead metadata in beadsync
+- [ ] T010 [P] [US2] Implement format_gh_body for task Beads in bdim
+- [ ] T011 [US2] Implement _sync_one_bead create path in bdim
+- [ ] T012 [US2] Implement _sync_one_bead update/skip path in bdim
+- [ ] T013 [US2] Write back github_issue_number/url to Bead metadata in bdim
 
-**Checkpoint**: beadsync sync pushes Beads to GitHub Issues
+**Checkpoint**: bdim sync pushes Beads to GitHub Issues
 
 ---
 
@@ -68,10 +68,10 @@ description: "Task list template for feature implementation"
 
 **Goal**: Show sync state table; support team git workflow via JSONL export
 
-**Independent Test**: Run beadsync status and verify table output
+**Independent Test**: Run bdim status and verify table output
 
-- [ ] T014 [P] [US3] Implement cmd_status table output in beadsync
-- [ ] T015 [US3] Implement bd_export_jsonl for team sharing in beadsync
+- [ ] T014 [P] [US3] Implement cmd_status table output in bdim
+- [ ] T015 [US3] Implement bd_export_jsonl for team sharing in bdim
 - [ ] T016 [US3] Document team workflow in README.md
 
 **Checkpoint**: Full pipeline works end-to-end

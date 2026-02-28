@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# beadsync — spec-kit tasks.md → Beads → GitHub Issues workflow bridge
+# bdim — spec-kit tasks.md → Beads → GitHub Issues workflow bridge
 # Version  : 3.0.0
 # Requires : bash ≥ 3.2, jq, gh (GitHub CLI), bd (Beads CLI)
 # =============================================================================
 # SOURCE OF TRUTH MODEL
 #   Phase 1 — spec-kit is canonical.  Run: /speckit.tasks → generates tasks.md
-#              Then: beadsync speckit-to-beads  (auto-reads .specify/specs/*/tasks.md)
+#              Then: bdim speckit-to-beads  (auto-reads .specify/specs/*/tasks.md)
 #   Phase 2 — Beads are canonical.   Run: beads-to-gh / sync
 #   GitHub Issues are read-only projections of Beads.
 #   GitHub edits do NOT flow back into Beads unless --force is used.
@@ -246,7 +246,7 @@ bd_get_bead_json() {
 }
 
 # Adapt bd show --json output to the internal format that format_gh_body expects.
-# Maps bd field names → the field names beadsync uses internally.
+# Maps bd field names → the field names bdim uses internally.
 bd_json_to_internal() {
   local bd_json="$1"
   jq -c '{
@@ -595,7 +595,7 @@ cmd_speckit_to_beads() {
 # =============================================================================
 
 # Produces a clean GitHub Markdown issue body.
-# The hidden HTML comment <!-- beadsync:external_id:... --> is the idempotency
+# The hidden HTML comment <!-- bdim:external_id:... --> is the idempotency
 # anchor used by find_gh_issue_by_external_id().
 # Expects the internal bead format produced by bd_json_to_internal().
 format_gh_body() {
@@ -663,10 +663,10 @@ format_gh_body() {
     fi
   fi
 
-  body+="\n_Managed by [beadsync](https://github.com/steveyegge/beads). "
+  body+="\n_Managed by [bdim](https://github.com/steveyegge/beads). "
   body+="Edit the Bead, not this issue._\n\n"
   # Idempotency anchor — DO NOT REMOVE
-  body+="<!-- beadsync:external_id:${external_id} -->"
+  body+="<!-- bdim:external_id:${external_id} -->"
 
   printf '%b' "$body"
 }
@@ -683,7 +683,7 @@ find_gh_issue_by_external_id() {
 
   log_debug "Searching GitHub for external_id: $external_id"
 
-  local query="repo:${repo} in:body beadsync:external_id:${external_id}"
+  local query="repo:${repo} in:body bdim:external_id:${external_id}"
   gh api "search/issues" \
     --method GET \
     -f q="$query" \
@@ -968,7 +968,7 @@ _run_gh_sync() {
       log_warn "bd database is empty but .beads/issues.jsonl exists."
       log_warn "Run: bd import -i .beads/issues.jsonl  then retry."
     else
-      log_warn "No beads found.  Run: beadsync speckit-to-beads first."
+      log_warn "No beads found.  Run: bdim speckit-to-beads first."
     fi
     return 0
   fi
@@ -1030,7 +1030,7 @@ cmd_beads_to_gh() {
     esac
   done
 
-  [[ -n "$repo" ]] || die_usage "Usage: beadsync beads-to-gh --repo owner/name"
+  [[ -n "$repo" ]] || die_usage "Usage: bdim beads-to-gh --repo owner/name"
 
   _run_gh_sync "$repo" "$force_update"
 }
@@ -1051,7 +1051,7 @@ cmd_sync() {
     esac
   done
 
-  [[ -n "$repo" ]] || die_usage "Usage: beadsync sync --repo owner/name"
+  [[ -n "$repo" ]] || die_usage "Usage: bdim sync --repo owner/name"
 
   _run_gh_sync "$repo" "$force_update"
 }
@@ -1085,7 +1085,7 @@ cmd_status() {
       log_warn "bd database is empty but .beads/issues.jsonl exists."
       log_warn "Run: bd import -i .beads/issues.jsonl  then try again."
     else
-      log_warn "No beads found.  Run: beadsync speckit-to-beads first."
+      log_warn "No beads found.  Run: bdim speckit-to-beads first."
     fi
     return 0
   fi
@@ -1142,10 +1142,10 @@ cmd_status() {
 
 show_usage() {
   cat <<EOF
-${BOLD}beadsync${RESET} v${VERSION}  —  spec-kit tasks.md → Beads → GitHub Issues
+${BOLD}bdim${RESET} v${VERSION}  —  spec-kit tasks.md → Beads → GitHub Issues
 
 ${BOLD}USAGE${RESET}
-  beadsync <command> [options]
+  bdim <command> [options]
 
 ${BOLD}COMMANDS${RESET}
 
@@ -1196,7 +1196,7 @@ ${BOLD}DEPENDENCIES${RESET}
 
 ${BOLD}TEAM WORKFLOW (multi-machine)${RESET}
 
-  beadsync auto-exports .beads/issues.jsonl after every write command so the
+  bdim auto-exports .beads/issues.jsonl after every write command so the
   bead database can be committed to git and shared with your team.
 
   Setup — add to your project's .gitignore:
@@ -1209,8 +1209,8 @@ ${BOLD}TEAM WORKFLOW (multi-machine)${RESET}
   Workflow for each team member:
     git pull
     bd import -i .beads/issues.jsonl   ← rebuild local Dolt DB
-    beadsync speckit-to-beads          ← creates/updates beads + auto-exports
-    beadsync sync --repo ...           ← pushes to GitHub   + auto-exports
+    bdim speckit-to-beads          ← creates/updates beads + auto-exports
+    bdim sync --repo ...           ← pushes to GitHub   + auto-exports
     git add .beads/issues.jsonl && git commit && git push
 
 ${BOLD}EXIT CODES${RESET}
@@ -1223,33 +1223,33 @@ ${BOLD}EXAMPLES${RESET}
 
   # Phase 1 — run /speckit.tasks first to generate .specify/specs/*/tasks.md
   # then import all tasks into bd:
-  ./beadsync speckit-to-beads
-  ./beadsync speckit-to-beads --dry-run
-  ./beadsync speckit-to-beads --project myproject   # single spec only
+  ./bdim speckit-to-beads
+  ./bdim speckit-to-beads --dry-run
+  ./bdim speckit-to-beads --project myproject   # single spec only
 
   # Phase 2a — push all Beads to GitHub Issues (first time)
-  ./beadsync beads-to-gh --repo acme/my-project --dry-run
-  ./beadsync beads-to-gh --repo acme/my-project
+  ./bdim beads-to-gh --repo acme/my-project --dry-run
+  ./bdim beads-to-gh --repo acme/my-project
 
   # Phase 2b — sync changed Beads (idempotent, run as often as needed)
-  ./beadsync sync --repo acme/my-project
+  ./bdim sync --repo acme/my-project
 
   # Force-push all Beads (overrides any manual GitHub edits)
-  ./beadsync sync --repo acme/my-project --force
+  ./bdim sync --repo acme/my-project --force
 
   # Check sync state without touching anything
-  ./beadsync status
+  ./bdim status
 
 ${BOLD}SOURCE OF TRUTH MODEL${RESET}
 
   1. spec-kit /speckit.tasks generates .specify/specs/*/tasks.md
-  2. beadsync speckit-to-beads reads those files and creates Beads in bd.
+  2. bdim speckit-to-beads reads those files and creates Beads in bd.
   3. After Beads exist in bd, Beads are the source of truth.
   4. GitHub Issues are read-only projections of Beads.
   5. GitHub edits do NOT override Beads (unless --force is used).
   6. Changes flow:
-       Phase 1:  /speckit.tasks → tasks.md → beadsync speckit-to-beads → bd
-       Phase 2:  bd Beads → beadsync sync → GitHub Issues
+       Phase 1:  /speckit.tasks → tasks.md → bdim speckit-to-beads → bd
+       Phase 2:  bd Beads → bdim sync → GitHub Issues
 
 EOF
 }
@@ -1270,7 +1270,7 @@ main() {
     beads-to-gh|b2g)        cmd_beads_to_gh "$@" ;;
     sync)                   cmd_sync "$@" ;;
     status|st)              cmd_status "$@" ;;
-    version|--version|-V)   printf 'beadsync v%s\n' "$VERSION"; exit 0 ;;
+    version|--version|-V)   printf 'bdim v%s\n' "$VERSION"; exit 0 ;;
     help|--help|-h)         show_usage; exit 0 ;;
     *)
       log_error "Unknown command: $cmd"
