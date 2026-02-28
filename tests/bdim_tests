@@ -131,6 +131,8 @@ assert_output_contains "help lists create"               "create"            "$B
 assert_output_contains "help lists convert"              "convert"           "$BDIM" help
 assert_output_contains "help lists sync"                 "sync"              "$BDIM" help
 assert_output_contains "help lists status"               "status"            "$BDIM" help
+assert_output_contains "help lists latest"               "latest"            "$BDIM" help
+assert_output_contains "help lists update"               "update"            "$BDIM" help
 
 # -----------------------------------------------------------------------------
 section "Removed / unknown commands"
@@ -141,6 +143,55 @@ assert_exit "old speckit-to-beads removed"      2  "$BDIM" speckit-to-beads
 assert_exit "old beads-to-gh removed"           2  "$BDIM" beads-to-gh
 assert_exit "old s2b alias removed"             2  "$BDIM" s2b
 assert_exit "old b2g alias removed"             2  "$BDIM" b2g
+
+# -----------------------------------------------------------------------------
+section "latest"
+# -----------------------------------------------------------------------------
+
+# Outside a git repo — must fail with a clear error
+NOGIT="$TMPDIR_TEST/nogit-latest"
+mkdir -p "$NOGIT"
+cd "$NOGIT"
+assert_exit_contains "latest fails outside git repo"    1  "Not a git repository"  "$BDIM" latest
+assert_exit_contains "latest --dry-run fails outside git repo" 1 "Not a git repository" "$BDIM" latest --dry-run
+cd "$ORIG_DIR"
+
+# Inside a git repo — dry-run should show both steps without running them
+GITREPO_LATEST="$TMPDIR_TEST/gitrepo-latest"
+mkdir -p "$GITREPO_LATEST"
+cd "$GITREPO_LATEST"
+git init -q
+assert_exit_contains "latest --dry-run shows git pull"       0  "Would run: git pull"            "$BDIM" latest --dry-run
+assert_exit_contains "latest --dry-run shows bd import"      0  "Would run: bd import"           "$BDIM" latest --dry-run
+assert_exit           "latest rejects unknown flag"          1  "$BDIM" latest --no-such-flag
+cd "$ORIG_DIR"
+
+# -----------------------------------------------------------------------------
+section "update"
+# -----------------------------------------------------------------------------
+
+# Outside a git repo — must fail with a clear error
+NOGIT2="$TMPDIR_TEST/nogit-update"
+mkdir -p "$NOGIT2"
+cd "$NOGIT2"
+assert_exit_contains "update fails outside git repo"    1  "Not a git repository"  "$BDIM" update
+assert_exit_contains "update --dry-run fails outside git repo" 1 "Not a git repository" "$BDIM" update --dry-run
+cd "$ORIG_DIR"
+
+# Inside a git repo — dry-run should show all three git steps
+GITREPO_UPDATE="$TMPDIR_TEST/gitrepo-update"
+mkdir -p "$GITREPO_UPDATE"
+cd "$GITREPO_UPDATE"
+git init -q
+assert_exit_contains "update --dry-run shows bd export"      0  "Would run: bd export"           "$BDIM" update --dry-run
+assert_exit_contains "update --dry-run shows git add"        0  "Would run: git add"             "$BDIM" update --dry-run
+assert_exit_contains "update --dry-run shows git commit"     0  "Would run: git commit"          "$BDIM" update --dry-run
+assert_exit_contains "update --dry-run shows git push"       0  "Would run: git push"            "$BDIM" update --dry-run
+assert_exit_contains "update --dry-run default commit msg"   0  "Update beads"                   "$BDIM" update --dry-run
+assert_exit_contains "update --dry-run custom commit msg"    0  "My custom message"              "$BDIM" update --dry-run --message "My custom message"
+assert_exit_contains "update -m short flag works"            0  "Short flag msg"                 "$BDIM" update --dry-run -m "Short flag msg"
+assert_exit           "update rejects unknown flag"          1  "$BDIM" update --no-such-flag
+cd "$ORIG_DIR"
 
 # -----------------------------------------------------------------------------
 section "Argument validation"

@@ -15,7 +15,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="3.1.0"
+VERSION="3.2.0"
 
 # ---------------------------------------------------------------------------
 # Colours (disabled when not a TTY)
@@ -1413,6 +1413,136 @@ cmd_init() {
 }
 
 # =============================================================================
+# TEAM WORKFLOW — latest / update
+# =============================================================================
+
+# Pull the latest shared bead database from git and import it into the local
+# bd database.  Replaces the manual two-step:
+#   git pull && bd import -i .beads/issues.jsonl
+cmd_latest() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)    DRY_RUN=true;  shift ;;
+      --verbose|-v) VERBOSE=true;  shift ;;
+      -*)           die "Unknown option: $1" ;;
+      *)            die_usage "latest takes no positional arguments" ;;
+    esac
+  done
+
+  git rev-parse --git-dir &>/dev/null 2>&1 \
+    || die "Not a git repository.  Run bdim latest from your project root."
+
+  [[ "$DRY_RUN" != true ]] && check_bd_dep
+  [[ "$DRY_RUN" != true ]] && check_bd_init
+
+  # ── Step 1: git pull ───────────────────────────────────────────────────────
+  log_info "Pulling latest changes from remote..."
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would run: git pull"
+  else
+    if ! git pull; then
+      die "git pull failed.  Resolve any conflicts, then re-run bdim latest."
+    fi
+    log_info "  git pull complete."
+  fi
+
+  # ── Step 2: bd import ─────────────────────────────────────────────────────
+  local jsonl_path=".beads/issues.jsonl"
+  if [[ "$DRY_RUN" != true && ! -f "$jsonl_path" ]]; then
+    log_warn "$jsonl_path not found — nothing to import."
+    log_warn "Run 'bdim create' to generate beads, then share $jsonl_path via git."
+    return 0
+  fi
+
+  log_info "Importing beads from $jsonl_path..."
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would run: bd import -i $jsonl_path"
+  else
+    if ! bd import -i "$jsonl_path"; then
+      die "bd import failed.  Check that $jsonl_path is a valid JSONL file."
+    fi
+    log_info "  Import complete."
+  fi
+
+  log_info "Bead database is up to date."
+}
+
+# Export the bead database, stage .beads/issues.jsonl, commit, and push.
+# Replaces the manual three-step:
+#   git add .beads/issues.jsonl && git commit -m "..." && git push
+cmd_update() {
+  local commit_msg="Update beads"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --message|-m) commit_msg="$2"; shift 2 ;;
+      --dry-run)    DRY_RUN=true;    shift ;;
+      --verbose|-v) VERBOSE=true;    shift ;;
+      -*)           die "Unknown option: $1" ;;
+      *)            die_usage "update takes no positional arguments" ;;
+    esac
+  done
+
+  git rev-parse --git-dir &>/dev/null 2>&1 \
+    || die "Not a git repository.  Run bdim update from your project root."
+
+  [[ "$DRY_RUN" != true ]] && check_bd_dep
+  [[ "$DRY_RUN" != true ]] && check_bd_init
+
+  local jsonl_path=".beads/issues.jsonl"
+
+  # ── Step 1: bd export (ensure JSONL reflects current state of bd) ──────────
+  log_info "Exporting bead database → $jsonl_path"
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would run: bd export -o $jsonl_path -q"
+  else
+    if ! bd export -o "$jsonl_path" -q 2>/dev/null; then
+      die "bd export failed.  Ensure bd is initialised (bdim init)."
+    fi
+    log_info "  Export complete."
+  fi
+
+  # ── Step 2: check for changes (skip commit if nothing changed) ─────────────
+  if [[ "$DRY_RUN" != true ]]; then
+    if [[ -z "$(git status --porcelain "$jsonl_path" 2>/dev/null)" ]]; then
+      log_info "No changes to $jsonl_path — nothing to commit."
+      return 0
+    fi
+  fi
+
+  # ── Step 3: git add ────────────────────────────────────────────────────────
+  log_info "Staging $jsonl_path..."
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would run: git add $jsonl_path"
+  else
+    git add "$jsonl_path"
+  fi
+
+  # ── Step 4: git commit ─────────────────────────────────────────────────────
+  log_info "Committing: \"$commit_msg\""
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would run: git commit -m \"$commit_msg\""
+  else
+    if ! git commit -m "$commit_msg"; then
+      die "git commit failed."
+    fi
+  fi
+
+  # ── Step 5: git push ───────────────────────────────────────────────────────
+  log_info "Pushing to remote..."
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would run: git push"
+  else
+    if ! git push; then
+      die "git push failed.  Try: bdim latest  then re-run bdim update."
+    fi
+    log_info "  Pushed successfully."
+  fi
+
+  log_info "Bead database shared with team."
+}
+
+# =============================================================================
 # USAGE
 # =============================================================================
 
@@ -1464,6 +1594,25 @@ ${BOLD}COMMANDS${RESET}
       --all-beads      Include all beads regardless of label (default: speckit-labelled only)
       --verbose, -v    Verbose output
 
+  ${CYAN}latest${RESET}
+    Pull the latest shared bead database from git and import it into the local
+    bd database.  Equivalent to:
+      git pull && bd import -i .beads/issues.jsonl
+
+      --dry-run        Preview without running git or bd
+      --verbose, -v    Verbose output
+
+  ${CYAN}update${RESET}  [--message MSG]
+    Export the bead database, stage .beads/issues.jsonl, commit, and push.
+    Equivalent to:
+      git add .beads/issues.jsonl && git commit -m "..." && git push
+    Re-exports first to ensure the file is current.  Skips the commit if
+    .beads/issues.jsonl has not changed.
+
+      --message, -m MSG  Commit message (default: "Update beads")
+      --dry-run          Preview without running git or bd
+      --verbose, -v      Verbose output
+
 ${BOLD}ENVIRONMENT VARIABLES${RESET}
 
   GITHUB_TOKEN    Optional — gh CLI manages auth by default (gh auth login)
@@ -1485,15 +1634,11 @@ ${BOLD}TEAM WORKFLOW (multi-machine)${RESET}
     .beads/dolt/          ← binary Dolt DB, never commit
     .beads/*.db
 
-  Commit the JSONL (one bead per line, git-mergeable):
-    git add .beads/issues.jsonl && git commit -m "Update beads"
-
   Workflow for each team member:
-    git pull
-    bd import -i .beads/issues.jsonl   ← rebuild local Dolt DB
+    bdim latest                    ← git pull + bd import (get shared beads)
     bdim create                    ← creates/updates beads + auto-exports
     bdim sync --repo ...           ← pushes to GitHub   + auto-exports
-    git add .beads/issues.jsonl && git commit && git push
+    bdim update                    ← bd export + git add + commit + push
 
 ${BOLD}EXIT CODES${RESET}
 
@@ -1550,11 +1695,13 @@ main() {
   local cmd="$1"; shift
 
   case "$cmd" in
-    init)             cmd_init "$@" ;;
-    create)           cmd_create "$@" ;;
+    init)             cmd_init    "$@" ;;
+    create)           cmd_create  "$@" ;;
     convert)          cmd_convert "$@" ;;
-    sync)             cmd_sync "$@" ;;
-    status|st)        cmd_status "$@" ;;
+    sync)             cmd_sync    "$@" ;;
+    status|st)        cmd_status  "$@" ;;
+    latest)           cmd_latest  "$@" ;;
+    update)           cmd_update  "$@" ;;
     version|--version|-V)   printf 'bdim v%s\n' "$VERSION"; exit 0 ;;
     help|--help|-h)         show_usage; exit 0 ;;
     *)
