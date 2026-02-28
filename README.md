@@ -351,7 +351,7 @@ On `sync`, this anchor is used to find the matching issue so it is updated rathe
 
 ```
 bdim                       ← the CLI script (single file, v3.0.0)
-test/
+tests/
   bdim_tests               ← test suite (no bd/gh required)
 examples/
   tasks.md                 ← sample spec-kit tasks.md
