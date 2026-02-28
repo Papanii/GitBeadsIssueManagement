@@ -94,6 +94,28 @@ make_tasks_md() {
 EOF
 }
 
+make_tasks_md_with_epics() {
+  # make_tasks_md_with_epics <dir> <spec-folder-name>
+  local dir="$1" folder="$2"
+  mkdir -p "$dir/specs/$folder"
+  cat > "$dir/specs/$folder/tasks.md" <<'EOF'
+## Phase 1: Foundation (no user story)
+
+- [ ] T001 Create project structure
+- [ ] T002 [P] Set up CI pipeline
+
+## Phase 2: User Story 1 - Import tasks (Priority: P1)
+
+- [ ] T003 [P] [US1] Implement parser
+- [ ] T004 [US1] Map task fields
+
+## Phase 3: User Story 2 - Sync to GitHub (Priority: P2)
+
+- [ ] T005 [US2] Implement sync command
+- [ ] T006 [P] [US2] Write integration tests
+EOF
+}
+
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 # -----------------------------------------------------------------------------
@@ -197,6 +219,27 @@ cd "$PROJ4"
 # Both tasks should be previewed regardless of checkbox state
 assert_exit_contains "open task appears in dry-run"   0  "T001"  "$BDIM" create --dry-run
 assert_exit_contains "closed task appears in dry-run" 0  "T002"  "$BDIM" create --dry-run
+cd "$ORIG_DIR"
+
+# -----------------------------------------------------------------------------
+section "create --dry-run: epic support"
+# -----------------------------------------------------------------------------
+
+PROJ_EPIC="$TMPDIR_TEST/proj-epic"
+make_tasks_md_with_epics "$PROJ_EPIC" "001-auth"
+cd "$PROJ_EPIC"
+
+assert_exit_contains  "epic dry-run exits 0"                0  "Would create"           "$BDIM" create --dry-run
+assert_exit_contains  "epic dry-run shows US1 epic"         0  "Would create epic.*US1"  "$BDIM" create --dry-run
+assert_exit_contains  "epic dry-run shows US2 epic"         0  "Would create epic.*US2"  "$BDIM" create --dry-run
+assert_exit_contains  "epic dry-run shows child T003"       0  "T003"                    "$BDIM" create --dry-run
+assert_exit_contains  "epic dry-run shows child T004"       0  "T004"                    "$BDIM" create --dry-run
+assert_exit_contains  "epic dry-run shows child T005"       0  "T005"                    "$BDIM" create --dry-run
+assert_exit_contains  "epic dry-run shows child T006"       0  "T006"                    "$BDIM" create --dry-run
+assert_exit_contains  "non-US tasks still appear"           0  "T001"                    "$BDIM" create --dry-run
+assert_exit_contains  "non-US tasks still appear (T002)"    0  "T002"                    "$BDIM" create --dry-run
+assert_exit_contains  "epic summary line shows epics count" 0  "epics:"                  "$BDIM" create --dry-run
+
 cd "$ORIG_DIR"
 
 # -----------------------------------------------------------------------------

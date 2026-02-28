@@ -15,7 +15,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 
 # ---------------------------------------------------------------------------
 # Colours (disabled when not a TTY)
@@ -248,11 +248,174 @@ _project_id_from_folder() {
     | sed 's/^-//;s/-$//'
 }
 
+# Pre-scan tasks.md to map US numbers → epic titles from section headers.
+# For each [US\d+] marker, the title comes from the nearest preceding ## header.
+# Results stored in bash-3.2-safe named variables: us_title_1, us_title_2, …
+_collect_epic_titles() {
+  local tasks_file="$1"
+  local current_header=""
+  local seen_us=" "   # space-padded string for whole-word membership tests
+
+  while IFS= read -r line; do
+
+    # Track most-recent ## section header
+    if [[ "$line" =~ ^##[[:space:]]+(.+)$ ]]; then
+      current_header="${BASH_REMATCH[1]}"
+      current_header=$(printf '%s' "$current_header" | sed 's/[[:space:]]*$//')
+      continue
+    fi
+
+    # Check for a [US\d+] marker anywhere on the line
+    if [[ "$line" =~ \[US([0-9]+)\] ]]; then
+      local us_num="${BASH_REMATCH[1]}"
+      # Only record the first occurrence per US number
+      [[ "$seen_us" == *" ${us_num} "* ]] && continue
+      seen_us+="${us_num} "
+
+      # Extract a clean title from the current section header.
+      # Matches: "... User Story N - Some Title (optional suffix) 🎯 emoji"
+      local epic_title=""
+      if [[ -n "$current_header" && \
+            "$current_header" =~ User[[:space:]]+Story[[:space:]]+${us_num}[^-]*-[[:space:]]*(.+) ]]; then
+        epic_title="${BASH_REMATCH[1]}"
+        # Strip trailing "(…)" parentheticals (e.g. "(Priority: P1)") and trailing spaces
+        epic_title=$(printf '%s' "$epic_title" | sed 's/[[:space:]]*(.*$//' | sed 's/[[:space:]]*$//')
+      fi
+
+      if [[ -n "$epic_title" ]]; then
+        epic_title="User Story ${us_num}: ${epic_title}"
+      else
+        epic_title="User Story ${us_num}"
+      fi
+
+      printf -v "us_title_${us_num}" '%s' "$epic_title"
+      log_debug "Epic title for US${us_num}: ${epic_title}"
+    fi
+
+  done < "$tasks_file"
+}
+
+# Return value global for _ensure_epic_bead.
+_EPIC_BEAD_ACTION=""  # "created" | "updated" | "skipped" | "failed"
+
+# Create (or locate/update) the Beads epic for a user story tag.
+# Stores results in bash-3.2-safe named globals:
+#   us_epic_id_N  — bd bead ID (empty in dry-run; placeholder used internally)
+#   us_epic_ref_N — external_ref string (always set)
+# Sets _EPIC_BEAD_ACTION to: "created" | "updated" | "skipped" | "failed"
+_ensure_epic_bead() {
+  local project_id="$1"
+  local user_story_tag="$2"    # e.g. "US1"
+  local epic_title="$3"        # e.g. "User Story 1: Import spec-kit tasks"
+  local all_beads_json="$4"    # pre-fetched speckit beads JSON (may be "" in dry-run)
+
+  local us_num="${user_story_tag#US}"
+  local epic_external_ref="speckit-${project_id}-${user_story_tag}"
+  local epic_priority
+  epic_priority=$(map_us_priority "$user_story_tag")
+
+  # Compute a stable content hash for this epic
+  local epic_hash_json epic_content_hash
+  epic_hash_json=$(jq -cn \
+    --arg  title      "$epic_title" \
+    --arg  issue_type "epic" \
+    --argjson priority "$epic_priority" \
+    --arg  us         "$user_story_tag" \
+    '{title, issue_type, priority, user_story: $us}')
+  epic_content_hash=$(compute_content_hash "$epic_hash_json")
+
+  # Always register the external_ref so child tasks can reference it
+  printf -v "us_epic_ref_${us_num}" '%s' "$epic_external_ref"
+  _EPIC_BEAD_ACTION="failed"
+
+  # ---- Dry-run path --------------------------------------------------------
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would create epic: [${user_story_tag} / P${epic_priority}] ${epic_title}"
+    printf -v "us_epic_id_${us_num}" '%s' "dry-run-${user_story_tag}"
+    _EPIC_BEAD_ACTION="created"
+    return
+  fi
+
+  # ---- Idempotency: check for existing epic bead ---------------------------
+  local epic_bd_id=""
+  if [[ -n "$all_beads_json" ]]; then
+    epic_bd_id=$(printf '%s' "$all_beads_json" \
+      | jq -r --arg ref "$epic_external_ref" \
+        '.[]? | select(.external_ref == $ref) | .id' | head -1)
+  fi
+
+  if [[ -n "$epic_bd_id" ]]; then
+    # Epic exists — skip if unchanged, otherwise update title/priority
+    local existing_epic_json existing_epic_hash
+    existing_epic_json=$(bd_get_bead_json "$epic_bd_id")
+    existing_epic_hash=$(printf '%s' "$existing_epic_json" \
+      | jq -r '.metadata.content_hash // ""' 2>/dev/null || true)
+
+    if [[ "$existing_epic_hash" == "$epic_content_hash" ]]; then
+      log_debug "Epic for ${user_story_tag} unchanged — skipped ($epic_bd_id)"
+      printf -v "us_epic_id_${us_num}" '%s' "$epic_bd_id"
+      _EPIC_BEAD_ACTION="skipped"
+      return
+    fi
+
+    log_info "Updating epic: ${user_story_tag} — ${epic_title}"
+    bd update "$epic_bd_id" --title "$epic_title" -t epic \
+      -p "$epic_priority" --set-labels "speckit,${user_story_tag},epic" -q 2>/dev/null \
+      || log_warn "Could not update epic bead $epic_bd_id"
+
+    local updated_meta
+    updated_meta=$(printf '%s' "$existing_epic_json" | jq -c \
+      --arg ch "$epic_content_hash" \
+      '(.metadata // {}) + {content_hash: $ch}')
+    bd update "$epic_bd_id" --metadata "$updated_meta" -q 2>/dev/null \
+      || log_warn "Could not update metadata on epic $epic_bd_id"
+
+    printf -v "us_epic_id_${us_num}" '%s' "$epic_bd_id"
+    log_info "  Updated epic: $epic_bd_id"
+    _EPIC_BEAD_ACTION="updated"
+    return
+  fi
+
+  # ---- Create new epic bead ------------------------------------------------
+  log_info "Creating epic: ${user_story_tag} — ${epic_title}"
+
+  local new_epic_id
+  if ! new_epic_id=$(bd create "$epic_title" \
+      --external-ref "$epic_external_ref" \
+      -t epic \
+      -l "speckit,${user_story_tag},epic" \
+      -p "$epic_priority" \
+      --silent 2>/dev/null); then
+    log_error "Failed to create epic bead for ${user_story_tag}"
+    return
+  fi
+  new_epic_id=$(printf '%s' "$new_epic_id" | tr -d '[:space:]')
+
+  local epic_meta
+  epic_meta=$(jq -cn \
+    --arg us   "$user_story_tag" \
+    --arg ref  "$epic_external_ref" \
+    --arg ch   "$epic_content_hash" \
+    '{
+      source_system: "speckit",
+      is_epic:       true,
+      user_story:    $us,
+      task_id:       $ref,
+      content_hash:  $ch
+    }')
+  bd update "$new_epic_id" --metadata "$epic_meta" -q 2>/dev/null \
+    || log_warn "Could not set metadata on epic $new_epic_id"
+
+  printf -v "us_epic_id_${us_num}" '%s' "$new_epic_id"
+  log_info "  Created epic: $new_epic_id"
+  _EPIC_BEAD_ACTION="created"
+}
+
 _process_tasks_file() {
   local tasks_file="$1"
   local project_id="$2"
 
-  local created=0 updated=0 skipped=0 failed=0 task_count=0
+  local created=0 updated=0 skipped=0 failed=0 task_count=0 epics_created=0
 
   log_info "tasks.md     : $tasks_file"
   log_info "Project ID   : $project_id"
@@ -261,6 +424,12 @@ _process_tasks_file() {
   local _all_beads_json=""
   [[ "$DRY_RUN" != true ]] && \
     _all_beads_json=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
+
+  # Pre-scan to map US numbers → epic titles from section headers
+  _collect_epic_titles "$tasks_file"
+
+  # Track which US numbers have had their epic bead created/located
+  local us_seen_epic=" "
 
   while IFS= read -r line; do
 
@@ -304,6 +473,21 @@ _process_tasks_file() {
 
     task_count=$(( task_count + 1 ))
 
+    # ---- Ensure epic bead exists for this user story (first encounter) -----
+    local us_num=""
+    if [[ -n "$user_story" ]]; then
+      us_num="${user_story#US}"
+      if [[ "$us_seen_epic" != *" ${us_num} "* ]]; then
+        local epic_title_val
+        eval "epic_title_val=\${us_title_${us_num}:-User Story ${us_num}}"
+        _ensure_epic_bead "$project_id" "$user_story" "$epic_title_val" "$_all_beads_json"
+        us_seen_epic+="${us_num} "
+        case "$_EPIC_BEAD_ACTION" in
+          created|updated) epics_created=$(( epics_created + 1 )) ;;
+        esac
+      fi
+    fi
+
     # ---- Map fields --------------------------------------------------------
     local bead_status bead_priority
     [[ "$checked" == "x" ]] && bead_status="closed" || bead_status="open"
@@ -342,19 +526,26 @@ _process_tasks_file() {
     local parallel_bool="false"
     [[ "$parallel" == true ]] && parallel_bool="true"
 
+    local parent_external_ref=""
+    if [[ -n "$user_story" && -n "$us_num" ]]; then
+      eval "parent_external_ref=\${us_epic_ref_${us_num}:-}"
+    fi
+
     local base_meta_json
     base_meta_json=$(jq -cn \
-      --arg  ch  "$content_hash" \
-      --arg  tid "$task_id" \
-      --arg  us  "$user_story" \
-      --argjson p "$parallel_bool" \
+      --arg  ch    "$content_hash" \
+      --arg  tid   "$task_id" \
+      --arg  us    "$user_story" \
+      --arg  pref  "$parent_external_ref" \
+      --argjson p  "$parallel_bool" \
       '{
-        source_system: "speckit",
-        speckit_id:    $tid,
-        task_id:       $tid,
-        content_hash:  $ch,
-        user_story:    (if $us != "" then $us else null end),
-        parallel:      $p
+        source_system:       "speckit",
+        speckit_id:          $tid,
+        task_id:             $tid,
+        content_hash:        $ch,
+        user_story:          (if $us   != "" then $us   else null end),
+        parent_external_ref: (if $pref != "" then $pref else null end),
+        parallel:            $p
       } | with_entries(select(.value != null))')
 
     # ========================================================================
@@ -461,17 +652,20 @@ _process_tasks_file() {
 
   printf '\n'
   log_info "  Tasks parsed : $task_count  |  created: $created, updated: $updated, skipped: $skipped, failed: $failed"
+  [[ "$epics_created" -gt 0 ]] && log_info "  Epics created: $epics_created"
 
   # Return counters via globals so caller can accumulate across files
   _S2B_CREATED=$(( _S2B_CREATED + created ))
   _S2B_UPDATED=$(( _S2B_UPDATED + updated ))
   _S2B_FAILED=$((  _S2B_FAILED  + failed  ))
+  _S2B_EPICS=$((   _S2B_EPICS   + epics_created ))
 }
 
 # Global accumulators for _process_tasks_file
 _S2B_CREATED=0
 _S2B_UPDATED=0
 _S2B_FAILED=0
+_S2B_EPICS=0
 
 cmd_create() {
   local project_id_flag=""
@@ -509,7 +703,7 @@ cmd_create() {
   log_info "Found ${#tasks_files[@]} tasks.md file(s)"
   [[ "$DRY_RUN" == true ]] && log_warn "Dry-run mode — no beads will be created or updated"
 
-  _S2B_CREATED=0; _S2B_UPDATED=0; _S2B_FAILED=0
+  _S2B_CREATED=0; _S2B_UPDATED=0; _S2B_FAILED=0; _S2B_EPICS=0
 
   local f project_id
   for f in "${tasks_files[@]}"; do
@@ -522,7 +716,7 @@ cmd_create() {
   done
 
   printf '\n'
-  log_info "create complete — created: $_S2B_CREATED, updated: $_S2B_UPDATED, failed: $_S2B_FAILED"
+  log_info "create complete — epics: $_S2B_EPICS, created: $_S2B_CREATED, updated: $_S2B_UPDATED, failed: $_S2B_FAILED"
   [[ "$DRY_RUN" == true ]] && log_warn "Dry-run — no beads were created or updated."
 
   [[ $(( _S2B_CREATED + _S2B_UPDATED )) -gt 0 ]] && bd_export_jsonl
@@ -601,6 +795,58 @@ format_gh_body() {
       [[ $m -gt 0 ]] && est+=" ${m}m"
       body+="| Estimate | \`${est}\` |\n"
     fi
+  fi
+
+  body+="\n_Managed by [bdim](https://github.com/steveyegge/beads). "
+  body+="Edit the Bead, not this issue._\n\n"
+  # Idempotency anchor — DO NOT REMOVE
+  body+="<!-- bdim:external_id:${external_id} -->"
+
+  printf '%b' "$body"
+}
+
+# Produces a GitHub Markdown issue body for an epic bead.
+# children_json: JSON array of {task_id, title, github_issue_number} objects.
+# On first sync, github_issue_number may be null — task-list entries fall back
+# to plain text.  A subsequent bdim sync fills in the real #N links once
+# child issues exist.
+format_epic_gh_body() {
+  local bead_json="$1"
+  local children_json="$2"
+
+  local external_id title priority user_story
+  external_id=$(printf '%s' "$bead_json" | jq -r '.external_id          // ""')
+  title=$(printf '%s'       "$bead_json" | jq -r '.title                // ""')
+  priority=$(printf '%s'    "$bead_json" | jq -r '.priority             // 2')
+  user_story=$(printf '%s'  "$bead_json" | jq -r '.metadata.user_story  // ""')
+
+  local body=""
+  body+="## Epic: ${title}\n\n"
+  body+="| Field | Value |\n"
+  body+="| --- | --- |\n"
+  body+="| Type | epic |\n"
+  [[ -n "$user_story" ]] && body+="| User Story | \`${user_story}\` |\n"
+  body+="| Priority | P${priority} |\n"
+
+  # Children task list
+  local children_count
+  children_count=$(printf '%s' "$children_json" | jq 'length' 2>/dev/null || echo 0)
+
+  if [[ "$children_count" -gt 0 ]]; then
+    body+="\n## Children\n\n"
+    while IFS= read -r child; do
+      local child_task_id child_title child_gh_num
+      child_task_id=$(printf '%s' "$child" | jq -r '.task_id              // ""')
+      child_title=$(printf '%s'   "$child" | jq -r '.title                // ""')
+      child_gh_num=$(printf '%s'  "$child" | jq -r '.github_issue_number  // ""')
+
+      local task_label="${child_task_id}: ${child_title}"
+      if [[ -n "$child_gh_num" && "$child_gh_num" != "null" ]]; then
+        body+="- [ ] #${child_gh_num} ${task_label}\n"
+      else
+        body+="- [ ] ${task_label}\n"
+      fi
+    done < <(printf '%s' "$children_json" | jq -c '.[]' 2>/dev/null)
   fi
 
   body+="\n_Managed by [bdim](https://github.com/steveyegge/beads). "
@@ -698,6 +944,7 @@ _sync_one_bead() {
   local bd_raw_json="$2"   # raw JSON from bd show --json (single object)
   local bd_id="$3"
   local force_update="$4"
+  local children_list_json="${5:-}"  # JSON array of children for epic issues
   # Sets _BEAD_SYNC_RESULT to: "created" | "updated" | "skipped" | "failed"
 
   _BEAD_SYNC_RESULT="failed"
@@ -732,7 +979,13 @@ _sync_one_bead() {
 
   # ---- Prepare GitHub payload ----------------------------------------------
   local body
-  body=$(format_gh_body "$bead_json")
+  local is_epic
+  is_epic=$(printf '%s' "$bd_raw_json" | jq -r '.metadata.is_epic // false')
+  if [[ "$is_epic" == "true" ]]; then
+    body=$(format_epic_gh_body "$bead_json" "${children_list_json:-[]}")
+  else
+    body=$(format_gh_body "$bead_json")
+  fi
 
   local labels_raw
   labels_raw=$(printf '%s' "$bead_json" | jq -r '.labels // [] | .[]' 2>/dev/null)
@@ -913,6 +1166,13 @@ _run_gh_sync() {
     return 0
   fi
 
+  # Sort so non-epics come first: children get GitHub issue numbers before
+  # the epic body is built, enabling real #N links in the task list.
+  local sorted_beads_json
+  sorted_beads_json=$(printf '%s' "$beads_list" | jq -c \
+    '(map(select(.metadata.is_epic != true)) + map(select(.metadata.is_epic == true)))' \
+    2>/dev/null || printf '%s' "$beads_list")
+
   local created=0 updated=0 skipped=0 failed=0 bead_count=0
 
   while IFS= read -r bead_item; do
@@ -929,8 +1189,28 @@ _run_gh_sync() {
 
     (( bead_count++ ))
 
+    # For epic beads: build the children list from the pre-fetched beads_list,
+    # and always force-update so the task list stays current with #N links.
+    local children_list_json=""
+    local bead_is_epic sync_force
+    bead_is_epic=$(printf '%s' "$full_bead_json" | jq -r '.metadata.is_epic // false')
+    sync_force="$force_update"
+
+    if [[ "$bead_is_epic" == "true" ]]; then
+      local epic_ext_ref
+      epic_ext_ref=$(printf '%s' "$full_bead_json" | jq -r '.external_ref // ""')
+      children_list_json=$(printf '%s' "$beads_list" | jq -c \
+        --arg pref "$epic_ext_ref" \
+        '[.[] | select(.metadata.parent_external_ref == $pref) | {
+          task_id:             (.metadata.task_id // ""),
+          title:               .title,
+          github_issue_number: (.metadata.github_issue_number // null)
+        }]' 2>/dev/null || echo "[]")
+      sync_force="true"  # Always rebuild epic body (children may have gained #N links)
+    fi
+
     _BEAD_SYNC_RESULT="failed"
-    _sync_one_bead "$repo" "$full_bead_json" "$bd_id" "$force_update" || true
+    _sync_one_bead "$repo" "$full_bead_json" "$bd_id" "$sync_force" "$children_list_json" || true
 
     case "$_BEAD_SYNC_RESULT" in
       created) (( created++ )) ;;
@@ -938,7 +1218,7 @@ _run_gh_sync() {
       skipped) (( skipped++ )) ;;
       *)       (( failed++  )) ;;
     esac
-  done < <(printf '%s' "$beads_list" | jq -c '.[]' 2>/dev/null)
+  done < <(printf '%s' "$sorted_beads_json" | jq -c '.[]' 2>/dev/null)
 
   if [[ $bead_count -eq 0 ]]; then
     log_warn "No beads found to sync."
