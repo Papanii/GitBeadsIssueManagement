@@ -79,12 +79,16 @@ After this, `bdim` works from any directory.
 ## Quick start
 
 ```bash
-# 1. Initialise bd in your project (first time only)
+# 1. Initialise spec-kit + bd in your project (first time only)
 cd your-project/
 bdim init
 
-# 2. Generate tasks.md from your spec in the Claude chat / IDE
-/speckit.tasks
+# 2. Run the spec-kit workflow in your AI agent (Claude chat / IDE)
+/speckit.constitution        # establish project principles
+/speckit.specify             # define feature requirements & user stories
+/speckit.clarify             # (optional) resolve ambiguities in the spec
+/speckit.plan                # create technical implementation plan
+/speckit.tasks               # generate tasks.md from the plan
 
 # 3. Import tasks into your local bd database
 bdim create
@@ -93,7 +97,7 @@ bdim create
 bdim sync --repo owner/my-project
 ```
 
-That's it. Re-run `bdim sync` whenever you update tasks — unchanged Beads are skipped automatically.
+That's it. Re-run steps 2–4 whenever you add or update features — unchanged Beads are skipped automatically.
 
 ---
 
