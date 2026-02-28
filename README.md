@@ -51,8 +51,9 @@ npm i -g @beads/bd
 | `jq` | everything | `brew install jq` |
 | `gh` | `convert` / `sync` | `brew install gh` |
 | `bd` | `create`, `status`, `sync`, `latest`, `update` | `npm i -g @beads/bd` |
+| `specify` | `init` | `npm i -g @spec-kit/cli` |
 
-You also need [spec-kit](https://github.com/github/spec-kit) installed in your project so that `/speckit.tasks` can generate `tasks.md`.
+You also need [spec-kit](https://github.com/github/spec-kit) installed so that `bdim init` can scaffold the project and `/speckit.tasks` can generate `tasks.md`.
 
 ---
 
@@ -104,7 +105,13 @@ That's it. Re-run `bdim sync` whenever you update tasks — unchanged Beads are 
 bdim init [--dry-run]
 ```
 
-Initialises the `bd` database in the current directory and adds `.beads/dolt/` and `.beads/*.db` to `.gitignore`. Idempotent — safe to run multiple times; skips steps already completed.
+Initialises both **spec-kit** and the **bd database** in the current directory:
+
+1. **spec-kit** — runs `specify init --here --ai claude --force` to scaffold the spec-kit project (creates `constitution.md` and `specs/`). Skipped if either already exists.
+2. **bd database** — runs `bd init` to create the local Beads database. Skipped if already initialised.
+3. **.gitignore** — adds `.beads/dolt/` and `.beads/*.db` entries so binary database files are never committed.
+
+Idempotent — safe to run multiple times; each step is skipped if already completed.
 
 | Option | Description |
 |---|---|
