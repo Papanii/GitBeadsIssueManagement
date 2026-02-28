@@ -1137,6 +1137,81 @@ cmd_status() {
 }
 
 # =============================================================================
+# INIT
+# =============================================================================
+
+cmd_init() {
+  local dry_run_flag=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)    dry_run_flag=true; DRY_RUN=true; shift ;;
+      --verbose|-v) VERBOSE=true;                    shift ;;
+      -*)           die "Unknown option: $1" ;;
+      *)            die_usage "init takes no positional arguments" ;;
+    esac
+  done
+
+  check_bd_dep
+
+  # ── bd database ────────────────────────────────────────────────────────────
+  local already_init=false
+  if bd list --limit 1 --json &>/dev/null 2>&1; then
+    already_init=true
+  fi
+
+  if [[ "$already_init" == true ]]; then
+    log_info "bd database already initialised — skipping bd init."
+  else
+    log_info "Initialising bd database..."
+    if [[ "$DRY_RUN" == true ]]; then
+      log_dry "Would run: bd init"
+    else
+      bd init || die "bd init failed."
+      log_info "bd database initialised."
+    fi
+  fi
+
+  # ── .gitignore ─────────────────────────────────────────────────────────────
+  if git rev-parse --git-dir &>/dev/null 2>&1; then
+    local gitignore=".gitignore"
+    local entry_dolt=".beads/dolt/"
+    local entry_db=".beads/*.db"
+    local needs_dolt=true
+    local needs_db=true
+
+    if [[ -f "$gitignore" ]]; then
+      grep -qF "$entry_dolt" "$gitignore" 2>/dev/null && needs_dolt=false
+      grep -qF "$entry_db"   "$gitignore" 2>/dev/null && needs_db=false
+    fi
+
+    if [[ "$needs_dolt" == true ]] || [[ "$needs_db" == true ]]; then
+      if [[ "$DRY_RUN" == true ]]; then
+        [[ "$needs_dolt" == true ]] && log_dry "Would add to .gitignore: $entry_dolt"
+        [[ "$needs_db"   == true ]] && log_dry "Would add to .gitignore: $entry_db"
+      else
+        if [[ "$needs_dolt" == true ]]; then
+          printf '\n# bd (Beads) — binary database, never commit\n%s\n' "$entry_dolt" >> "$gitignore"
+          log_info "Added $entry_dolt to .gitignore"
+        fi
+        if [[ "$needs_db" == true ]]; then
+          printf '%s\n' "$entry_db" >> "$gitignore"
+          log_info "Added $entry_db to .gitignore"
+        fi
+      fi
+    else
+      log_info ".gitignore already contains bd entries — no changes needed."
+    fi
+  fi
+
+  printf '\n'
+  log_info "Setup complete. Next steps:"
+  log_info "  1. Run /speckit.tasks in your spec-kit project to generate tasks.md"
+  log_info "  2. bdim speckit-to-beads"
+  log_info "  3. bdim sync --repo owner/my-project"
+}
+
+# =============================================================================
 # USAGE
 # =============================================================================
 
@@ -1148,6 +1223,13 @@ ${BOLD}USAGE${RESET}
   bdim <command> [options]
 
 ${BOLD}COMMANDS${RESET}
+
+  ${CYAN}init${RESET}
+    Initialise the bd database in the current directory and add bd entries to
+    .gitignore.  Idempotent — safe to run multiple times.
+
+      --dry-run        Preview without writing anything
+      --verbose, -v    Verbose output
 
   ${CYAN}speckit-to-beads${RESET}  [--project ID]
     Read all tasks.md files under .specify/specs/*/tasks.md (auto-discovered)
@@ -1221,6 +1303,9 @@ ${BOLD}EXIT CODES${RESET}
 
 ${BOLD}EXAMPLES${RESET}
 
+  # First-time setup in a new project:
+  ./bdim init
+
   # Phase 1 — run /speckit.tasks first to generate .specify/specs/*/tasks.md
   # then import all tasks into bd:
   ./bdim speckit-to-beads
@@ -1266,6 +1351,7 @@ main() {
   local cmd="$1"; shift
 
   case "$cmd" in
+    init)                   cmd_init "$@" ;;
     speckit-to-beads|s2b)   cmd_speckit_to_beads "$@" ;;
     beads-to-gh|b2g)        cmd_beads_to_gh "$@" ;;
     sync)                   cmd_sync "$@" ;;
