@@ -128,7 +128,7 @@ assert_exit           "help exits 0"                     0                   "$B
 assert_exit           "no args exits 0"                  0                   "$BDIM"
 assert_output_contains "help lists init"                 "init"              "$BDIM" help
 assert_output_contains "help lists create"               "create"            "$BDIM" help
-assert_output_contains "help lists convert"              "convert"           "$BDIM" help
+assert_output_contains "help lists migrate"              "migrate"           "$BDIM" help
 assert_output_contains "help lists sync"                 "sync"              "$BDIM" help
 assert_output_contains "help lists status"               "status"            "$BDIM" help
 assert_output_contains "help lists latest"               "latest"            "$BDIM" help
@@ -197,14 +197,14 @@ cd "$ORIG_DIR"
 section "Argument validation"
 # -----------------------------------------------------------------------------
 
-assert_exit "convert requires --repo (exit 2)"   2  "$BDIM" convert
+assert_exit "migrate requires --repo (exit 2)"   2  "$BDIM" migrate
 assert_exit "sync requires --repo (exit 2)"      2  "$BDIM" sync
 assert_exit "create rejects unknown flag"        1  "$BDIM" create --no-such-flag
-assert_exit "convert rejects unknown flag"       1  "$BDIM" convert --no-such-flag
+assert_exit "migrate rejects unknown flag"       1  "$BDIM" migrate --no-such-flag
 assert_exit "init rejects unknown flag"          1  "$BDIM" init --no-such-flag
 
-assert_exit_contains "convert missing --repo shows usage"  2  "bdim convert" "$BDIM" convert
-assert_exit_contains "sync missing --repo shows usage"     2  "bdim convert" "$BDIM" sync
+assert_exit_contains "migrate missing --repo shows usage"  2  "bdim migrate" "$BDIM" migrate
+assert_exit_contains "sync missing --repo shows usage"     2  "bdim migrate" "$BDIM" sync
 
 # -----------------------------------------------------------------------------
 section "create --dry-run: tasks.md parsing"

@@ -8,7 +8,7 @@
 #   Phase 1 — spec-kit is canonical.  Run the spec-kit workflow:
 #              /speckit.constitution → /speckit.specify → /speckit.plan → /speckit.tasks
 #              Then: bdim create  (auto-reads specs/*/tasks.md)
-#   Phase 2 — Beads are canonical.   Run: bdim convert / bdim sync
+#   Phase 2 — Beads are canonical.   Run: bdim migrate / bdim sync
 #   GitHub Issues are read-only projections of Beads.
 #   GitHub edits do NOT flow back into Beads unless --force is used.
 # =============================================================================
@@ -1240,7 +1240,7 @@ _run_gh_sync() {
   [[ $failed -eq 0 ]] || { log_error "$failed bead(s) failed to sync"; return 1; }
 }
 
-cmd_convert() {
+cmd_migrate() {
   local repo=""
   local force_update=false
 
@@ -1256,12 +1256,12 @@ cmd_convert() {
     esac
   done
 
-  [[ -n "$repo" ]] || die_usage "Usage: bdim convert --repo owner/name"
+  [[ -n "$repo" ]] || die_usage "Usage: bdim migrate --repo owner/name"
 
   _run_gh_sync "$repo" "$force_update"
 }
 
-cmd_sync() { cmd_convert "$@"; }
+cmd_sync() { cmd_migrate "$@"; }
 
 # =============================================================================
 # STATUS REPORT
@@ -1600,7 +1600,7 @@ ${BOLD}COMMANDS${RESET}
       --dry-run        Preview without calling bd
       --verbose, -v    Verbose output
 
-  ${CYAN}convert${RESET}  --repo owner/name
+  ${CYAN}migrate${RESET}  --repo owner/name
     Push Beads (label=speckit) to GitHub Issues.  Creates new issues and
     updates existing ones.  Manual GitHub edits are preserved unless --force.
 
@@ -1611,9 +1611,9 @@ ${BOLD}COMMANDS${RESET}
       --verbose, -v    Verbose output
 
   ${CYAN}sync${RESET}  --repo owner/name
-    Alias for convert.  Only pushes Beads whose content has changed.
+    Alias for migrate.  Only pushes Beads whose content has changed.
 
-      Same options as convert.
+      Same options as migrate.
 
   ${CYAN}status${RESET}
     Print a table of all Beads (label=speckit) and their GitHub sync state.
@@ -1684,8 +1684,8 @@ ${BOLD}EXAMPLES${RESET}
   ./bdim create --project myproject   # single spec only
 
   # Phase 2 — push Beads to GitHub Issues
-  ./bdim convert --repo acme/my-project --dry-run
-  ./bdim convert --repo acme/my-project
+  ./bdim migrate --repo acme/my-project --dry-run
+  ./bdim migrate --repo acme/my-project
 
   # Ongoing — sync only changed Beads (idempotent)
   ./bdim sync --repo acme/my-project
@@ -1725,7 +1725,7 @@ main() {
   case "$cmd" in
     init)             cmd_init    "$@" ;;
     create)           cmd_create  "$@" ;;
-    convert)          cmd_convert "$@" ;;
+    migrate)          cmd_migrate "$@" ;;
     sync)             cmd_sync    "$@" ;;
     status|st)        cmd_status  "$@" ;;
     latest)           cmd_latest  "$@" ;;

@@ -53,7 +53,7 @@ npm i -g @beads/bd
 |---|---|---|
 | `bash` | everything | ships with macOS |
 | `jq` | everything | `brew install jq` |
-| `gh` | `convert` / `sync` | `brew install gh` |
+| `gh` | `migrate` / `sync` | `brew install gh` |
 | `bd` | `create`, `status`, `sync`, `latest`, `update` | `npm i -g @beads/bd` |
 | `specify` | `init` | `npm i -g @spec-kit/cli` |
 
@@ -159,10 +159,10 @@ bdim create --project my-project
 
 ---
 
-### `convert` — Push Beads to GitHub Issues
+### `migrate` — Push Beads to GitHub Issues
 
 ```bash
-bdim convert --repo owner/name [options]
+bdim migrate --repo owner/name [options]
 ```
 
 Reads Beads from the local `bd` database and pushes them to GitHub Issues. By default only Beads tagged `speckit` are included; pass `--all-beads` to sync every Bead regardless of label. Creates new issues for unsynced Beads and updates existing ones when content has changed. Manual edits to GitHub issues are preserved unless `--force` is used.
@@ -185,7 +185,7 @@ Epic Beads are synced last so child issues already have issue numbers, producing
 bdim sync --repo owner/name [options]
 ```
 
-Alias for `convert`. Only pushes Beads whose content has changed since the last sync. Same options as `convert`.
+Alias for `migrate`. Only pushes Beads whose content has changed since the last sync. Same options as `migrate`.
 
 ---
 
@@ -378,10 +378,10 @@ bdim status
 # --- Phase 3: Push to GitHub Issues ---
 
 # Preview GitHub changes
-bdim convert --repo acme/my-project --dry-run
+bdim migrate --repo acme/my-project --dry-run
 
 # Push to GitHub (epics get parent issues with child task lists)
-bdim convert --repo acme/my-project
+bdim migrate --repo acme/my-project
 
 # Run sync a second time to populate #N links in epic task lists
 bdim sync --repo acme/my-project
