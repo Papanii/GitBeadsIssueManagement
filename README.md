@@ -50,7 +50,7 @@ npm i -g @beads/bd
 | `bash` | everything | ships with macOS |
 | `jq` | everything | `brew install jq` |
 | `gh` | `convert` / `sync` | `brew install gh` |
-| `bd` | `create`, `status`, `sync` | `npm i -g @beads/bd` |
+| `bd` | `create`, `status`, `sync`, `latest`, `update` | `npm i -g @beads/bd` |
 
 You also need [spec-kit](https://github.com/github/spec-kit) installed in your project so that `/speckit.tasks` can generate `tasks.md`.
 
@@ -121,7 +121,7 @@ bdim create [options]
 
 Auto-discovers all `tasks.md` files under `specs/*/tasks.md` in the current directory and creates or updates Beads in the local `bd` database. No file path argument needed.
 
-Each task line becomes one Bead tagged with the `speckit` label. Project ID is derived automatically from the spec folder name (`001-my-feature` → `my-feature`). Fully idempotent — re-running only touches tasks that have changed.
+Each task line becomes one Bead tagged with the `speckit` label. `[US\d+]` markers automatically create an **epic** Bead for each unique user story — child tasks are linked underneath it. Project ID is derived automatically from the spec folder name (`001-my-feature` → `my-feature`). Fully idempotent — re-running only touches tasks that have changed.
 
 | Option | Default | Description |
 |---|---|---|
@@ -151,6 +151,8 @@ bdim convert --repo owner/name [options]
 ```
 
 Reads Beads from the local `bd` database and pushes them to GitHub Issues. By default only Beads tagged `speckit` are included; pass `--all-beads` to sync every Bead regardless of label. Creates new issues for unsynced Beads and updates existing ones when content has changed. Manual edits to GitHub issues are preserved unless `--force` is used.
+
+Epic Beads are synced last so child issues already have issue numbers, producing a native GitHub progress-bar task list in the epic issue body.
 
 | Option | Default | Description |
 |---|---|---|
@@ -194,6 +196,60 @@ Total: 3 | Synced: 1 | Needs sync: 2
 
 ---
 
+### `latest` — Pull shared beads from git
+
+```bash
+bdim latest [--dry-run]
+```
+
+Pulls the latest changes from the remote git repository and imports `.beads/issues.jsonl` into the local `bd` database. Replaces the manual two-step:
+
+```bash
+git pull
+bd import -i .beads/issues.jsonl
+```
+
+Stops immediately if `git pull` fails (e.g. merge conflict) so `bd import` is never run on a broken state. Warns gracefully if `.beads/issues.jsonl` is not present after the pull.
+
+| Option | Description |
+|---|---|
+| `--dry-run` | Preview without running git or bd |
+| `--verbose, -v` | Print debug output |
+
+---
+
+### `update` — Share your beads with the team
+
+```bash
+bdim update [--message MSG]
+```
+
+Exports the `bd` database to `.beads/issues.jsonl`, stages the file, commits it, and pushes. Replaces the manual three-step:
+
+```bash
+git add .beads/issues.jsonl
+git commit -m "Update beads"
+git push
+```
+
+Re-exports first to guarantee the file reflects the current state of `bd` (not just the last auto-export). Skips the commit entirely if `.beads/issues.jsonl` has not changed. If `git push` fails (e.g. remote is ahead), the error message suggests running `bdim latest` first.
+
+| Option | Default | Description |
+|---|---|---|
+| `--message, -m MSG` | `"Update beads"` | Custom git commit message |
+| `--dry-run` | off | Preview without running git or bd |
+| `--verbose, -v` | off | Print debug output |
+
+**Example:**
+
+```bash
+bdim update
+bdim update --message "Sync beads after US1 implementation"
+bdim update --dry-run   # preview what would happen
+```
+
+---
+
 ## tasks.md format
 
 spec-kit generates `tasks.md` under `specs/<NNN-feature-name>/tasks.md` at the repo root. Each task is a markdown checklist line:
@@ -210,12 +266,37 @@ spec-kit generates `tasks.md` under `specs/<NNN-feature-name>/tasks.md` at the r
 | `- [ ]` or `- [x]` | yes | Checkbox — unchecked = open, checked = closed |
 | `T001` | yes | Task ID — sequential, e.g. T001, T002, T003 |
 | `[P]` | no | Parallel marker — task can run concurrently with others |
-| `[US1]` | no | User story label — maps priority (US1=high, US2=medium, US3+=low) |
+| `[US1]` | no | User story / epic group — maps priority (US1=high, US2=medium, US3+=low) |
 | description | yes | Full task description including file path |
 
-All other lines (phase headers, blank lines, comments, dependency sections) are silently skipped.
+All other lines (phase headers, blank lines, comments, dependency sections) are silently skipped. Phase headers (`## Phase N: User Story N - Title`) are parsed to name the epic Bead automatically.
 
 See [`examples/tasks.md`](examples/tasks.md) for a complete sample.
+
+---
+
+## Epics
+
+Each unique `[US\d+]` marker in `tasks.md` creates one **epic** Bead of type `epic` in `bd`. Tasks tagged with that marker become children linked to the epic via `parent_external_ref` in their metadata.
+
+On GitHub, the epic becomes a parent issue with a `## Children` task list:
+
+```markdown
+## Epic: User Story 1: Import spec-kit tasks
+
+| Field | Value |
+| --- | --- |
+| Type | epic |
+| User Story | `US1` |
+| Priority | P1 |
+
+## Children
+
+- [ ] #7 T006: Implement tasks.md parser in bdim
+- [ ] #8 T007: Map task fields to Bead fields
+```
+
+GitHub auto-renders the task list with a **native progress bar** that ticks as child issues are closed. Run `bdim sync` a second time after the first to populate real `#N` links (children need one sync to receive issue numbers).
 
 ---
 
@@ -231,11 +312,13 @@ See [`examples/tasks.md`](examples/tasks.md) for a complete sample.
 | `[x]` | `status: closed` | |
 | `[P]` | `labels: parallel` | Added to label list |
 | `[US1]` | `labels: US1` + `priority: 1` | US2→P2, US3+→P3, no US→P2 |
-| — | `issue_type: task` | Always `task` |
+| `[US1]` (first task) | creates epic Bead | `issue_type: epic`, `external_ref: speckit-<project>-US1` |
+| — | `issue_type: task` | Always `task` for non-epic Beads |
 | — | `labels: speckit` | Always present — used for filtering |
 | task ID | `metadata.task_id` | |
 | user story | `metadata.user_story` | |
 | parallel flag | `metadata.parallel` | |
+| — | `metadata.parent_external_ref` | Set on child tasks; links to parent epic |
 
 ### Bead → GitHub Issue
 
@@ -243,6 +326,7 @@ See [`examples/tasks.md`](examples/tasks.md) for a complete sample.
 |---|---|---|
 | `title` | title | |
 | `metadata.task_id` + `metadata.user_story` | body | Rendered as a metadata table |
+| `metadata.is_epic == true` | body | Rendered as epic table + children task list |
 | `labels[]` | labels | Labels are created in the repo if missing |
 | `status == "closed"` | state = `closed` | Open otherwise |
 | — | body (HTML comment) | Hidden idempotency anchor for dedup |
@@ -266,7 +350,7 @@ bdim init                                # first time only — sets up bd + .git
 # Preview what will be created
 bdim create --dry-run
 
-# Import tasks as Beads
+# Import tasks as Beads (also creates epic Beads for [US\d+] groups)
 bdim create
 
 # Check the current sync state
@@ -277,8 +361,11 @@ bdim status
 # Preview GitHub changes
 bdim convert --repo acme/my-project --dry-run
 
-# Push to GitHub
+# Push to GitHub (epics get parent issues with child task lists)
 bdim convert --repo acme/my-project
+
+# Run sync a second time to populate #N links in epic task lists
+bdim sync --repo acme/my-project
 
 # --- Ongoing: re-run after tasks.md changes ---
 
@@ -304,19 +391,19 @@ bdim sync --repo acme/my-project     # syncs changes to GitHub
 ### Daily workflow
 
 ```bash
-# 1. Get the latest beads from the shared repo
-git pull
-bd import -i .beads/issues.jsonl         # rebuild your local Dolt DB
+# 1. Pull the latest shared beads
+bdim latest                          # git pull + bd import
 
-# 2. Run /speckit.tasks if there are spec changes, then import
+# 2. Run /speckit.tasks if there are spec changes, then:
 bdim create                          # auto-exports issues.jsonl
 bdim sync --repo acme/my-project     # auto-exports issues.jsonl
 
 # 3. Share the updated bead database
-git add .beads/issues.jsonl
-git commit -m "Update beads"
-git push
+bdim update                          # bd export + git add + commit + push
+bdim update --message "Sync after US2 epic"   # with a custom commit message
 ```
+
+`bdim latest` and `bdim update` replace the manual git/bd commands so the workflow is four lines instead of seven.
 
 ---
 
@@ -350,7 +437,7 @@ On `sync`, this anchor is used to find the matching issue so it is updated rathe
 ## Project structure
 
 ```
-bdim                       ← the CLI script (single file, v3.0.0)
+bdim                       ← the CLI script (single file, v3.2.0)
 tests/
   bdim_tests               ← test suite (no bd/gh required)
 examples/
