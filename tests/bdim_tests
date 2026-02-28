@@ -302,9 +302,20 @@ mkdir -p "$INIT1"
 cd "$INIT1"
 git init -q
 
+assert_exit_contains "init --dry-run shows specify init"   0  "Would run: specify init --here --ai claude --force"  "$BDIM" init --dry-run
 assert_exit_contains "init --dry-run shows bd init"        0  "Would run: bd init"  "$BDIM" init --dry-run
 assert_exit_contains "init --dry-run shows gitignore add"  0  ".beads/dolt/"        "$BDIM" init --dry-run
 assert_exit           "init --dry-run is idempotent"       0                        "$BDIM" init --dry-run
+
+# With specs/ already present — should skip specify init
+mkdir -p specs
+assert_exit_contains "init --dry-run skips specify if specs/ exists" 0 "spec-kit already initialised" "$BDIM" init --dry-run
+rm -rf specs
+
+# With constitution.md already present — should skip specify init
+touch constitution.md
+assert_exit_contains "init --dry-run skips specify if constitution.md exists" 0 "spec-kit already initialised" "$BDIM" init --dry-run
+rm -f constitution.md
 
 # With entries already in .gitignore — should report no changes needed
 printf '.beads/dolt/\n.beads/*.db\n' > .gitignore

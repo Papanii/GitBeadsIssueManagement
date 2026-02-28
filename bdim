@@ -72,6 +72,11 @@ check_bd_dep() {
     || die "bd (Beads CLI) required.  Install: npm i -g @beads/bd  (or: brew install beads)"
 }
 
+check_specify_dep() {
+  command -v specify &>/dev/null \
+    || die "specify (spec-kit CLI) required.  Install: npm i -g @spec-kit/cli"
+}
+
 # Verify that a bd database has been initialised in (or above) the current
 # directory.  Called after check_bd_dep so the error is targeted rather than
 # a raw bd failure message.
@@ -1353,7 +1358,22 @@ cmd_init() {
     esac
   done
 
+  check_specify_dep
   check_bd_dep
+
+  # ── spec-kit ────────────────────────────────────────────────────────────────
+  if [[ -f "constitution.md" ]] || [[ -d "specs" ]]; then
+    log_info "spec-kit already initialised — skipping specify init."
+  else
+    log_info "Initialising spec-kit project..."
+    if [[ "$DRY_RUN" == true ]]; then
+      log_dry "Would run: specify init --here --ai claude --force"
+    else
+      specify init --here --ai claude --force \
+        || die "specify init failed."
+      log_info "spec-kit project initialised."
+    fi
+  fi
 
   # ── bd database ────────────────────────────────────────────────────────────
   local already_init=false
