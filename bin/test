@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# bin/test — bdim test suite
+#
+# Tests CLI interface, argument parsing, and tasks.md parsing.
+# Does not require bd or gh to be installed.
+#
+# Usage: bash bin/test
+
+set -euo pipefail
+
+BDIM="$(cd "$(dirname "$0")/.." && pwd)/bdim"
+ORIG_DIR="$PWD"
+TMPDIR_TEST=$(mktemp -d)
+PASS=0
+FAIL=0
+
+cleanup() { cd "$ORIG_DIR"; rm -rf "$TMPDIR_TEST"; }
+trap cleanup EXIT
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+_green() { printf '\033[0;32m%s\033[0m' "$*"; }
+_red()   { printf '\033[0;31m%s\033[0m' "$*"; }
+_bold()  { printf '\033[1m%s\033[0m' "$*"; }
+
+pass()    { printf '  %s  %s\n' "$(_green '✓')" "$1"; PASS=$(( PASS + 1 )); }
+fail()    { printf '  %s  %s\n' "$(_red   '✗')" "$1"; FAIL=$(( FAIL + 1 )); }
+section() { printf '\n%s\n' "$(_bold "$1")"; }
+
+# Capture exit code without triggering set -e
+_exit_of() {
+  local code=0
+  "$@" &>/dev/null || code=$?
+  printf '%d' "$code"
+}
+
+# Capture combined stdout+stderr; always exits 0 in caller
+_output_of() { "$@" 2>&1 || true; }
+
+assert_exit() {
+  local desc="$1" expected="$2"; shift 2
+  local actual
+  actual=$(_exit_of "$@")
+  if [[ "$actual" -eq "$expected" ]]; then
+    pass "$desc"
+  else
+    fail "$desc  (expected exit $expected, got $actual)"
+  fi
+}
+
+assert_output_contains() {
+  local desc="$1" pattern="$2"; shift 2
+  local output
+  output=$(_output_of "$@")
+  if printf '%s' "$output" | grep -qE "$pattern"; then
+    pass "$desc"
+  else
+    fail "$desc  (pattern '$pattern' not in output)"
+  fi
+}
+
+assert_exit_contains() {
+  local desc="$1" expected_exit="$2" pattern="$3"; shift 3
+  local actual_exit=0 output
+  output=$("$@" 2>&1) || actual_exit=$?
+  local exit_ok=true output_ok=true
+  [[ "$actual_exit" -eq "$expected_exit" ]] || exit_ok=false
+  printf '%s' "$output" | grep -qE "$pattern"  || output_ok=false
+  if $exit_ok && $output_ok; then
+    pass "$desc"
+  else
+    local reason=""
+    $exit_ok   || reason+=" exit:got ${actual_exit} want ${expected_exit}"
+    $output_ok || reason+=" missing:'${pattern}'"
+    fail "$desc —$reason"
+  fi
+}
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+make_tasks_md() {
+  # make_tasks_md <dir> <spec-folder-name>
+  local dir="$1" folder="$2"
+  mkdir -p "$dir/specs/$folder"
+  cat > "$dir/specs/$folder/tasks.md" <<'EOF'
+## Phase 1 — Foundation
+
+- [ ] T001 Create project structure per implementation plan
+- [ ] T002 [P] Set up CI pipeline in .github/workflows/ci.yml
+- [x] T003 [P] [US1] Implement auth handler in src/auth.py
+- [ ] T004 [US1] Write unit tests for auth module
+- [ ] T005 [US2] Add integration tests
+- [ ] T006 [US3] Write developer documentation
+EOF
+}
+
+# ── tests ─────────────────────────────────────────────────────────────────────
+
+# -----------------------------------------------------------------------------
+section "Version & help"
+# -----------------------------------------------------------------------------
+
+assert_exit_contains  "version flag outputs version"     0  "bdim v[0-9]"   "$BDIM" --version
+assert_exit_contains  "version command outputs version"  0  "bdim v[0-9]"   "$BDIM" version
+assert_exit           "help exits 0"                     0                   "$BDIM" help
+assert_exit           "no args exits 0"                  0                   "$BDIM"
+assert_output_contains "help lists init"                 "init"              "$BDIM" help
+assert_output_contains "help lists create"               "create"            "$BDIM" help
+assert_output_contains "help lists convert"              "convert"           "$BDIM" help
+assert_output_contains "help lists sync"                 "sync"              "$BDIM" help
+assert_output_contains "help lists status"               "status"            "$BDIM" help
+
+# -----------------------------------------------------------------------------
+section "Removed / unknown commands"
+# -----------------------------------------------------------------------------
+
+assert_exit "unknown command exits 2"           2  "$BDIM" unknown-command
+assert_exit "old speckit-to-beads removed"      2  "$BDIM" speckit-to-beads
+assert_exit "old beads-to-gh removed"           2  "$BDIM" beads-to-gh
+assert_exit "old s2b alias removed"             2  "$BDIM" s2b
+assert_exit "old b2g alias removed"             2  "$BDIM" b2g
+
+# -----------------------------------------------------------------------------
+section "Argument validation"
+# -----------------------------------------------------------------------------
+
+assert_exit "convert requires --repo (exit 2)"   2  "$BDIM" convert
+assert_exit "sync requires --repo (exit 2)"      2  "$BDIM" sync
+assert_exit "create rejects unknown flag"        1  "$BDIM" create --no-such-flag
+assert_exit "convert rejects unknown flag"       1  "$BDIM" convert --no-such-flag
+assert_exit "init rejects unknown flag"          1  "$BDIM" init --no-such-flag
+
+assert_exit_contains "convert missing --repo shows usage"  2  "bdim convert" "$BDIM" convert
+assert_exit_contains "sync missing --repo shows usage"     2  "bdim convert" "$BDIM" sync
+
+# -----------------------------------------------------------------------------
+section "create --dry-run: tasks.md parsing"
+# -----------------------------------------------------------------------------
+
+PROJ1="$TMPDIR_TEST/proj1"
+make_tasks_md "$PROJ1" "001-auth"
+cd "$PROJ1"
+
+assert_exit_contains  "create --dry-run exits 0"           0  "Would create"     "$BDIM" create --dry-run
+assert_exit_contains  "create --dry-run reports T001"      0  "T001"             "$BDIM" create --dry-run
+assert_exit_contains  "create --dry-run reports T002"      0  "T002"             "$BDIM" create --dry-run
+assert_exit_contains  "create --dry-run shows [P] marker"  0  '\[P\]'            "$BDIM" create --dry-run
+assert_exit_contains  "create --dry-run shows US1 label"   0  "US1"              "$BDIM" create --dry-run
+assert_exit_contains  "create --dry-run shows US2 label"   0  "US2"              "$BDIM" create --dry-run
+assert_exit_contains  "create --project overrides name"    0  "custom-name"      "$BDIM" create --dry-run --project custom-name
+assert_exit_contains  "create summary line appears"        0  "created:"         "$BDIM" create --dry-run
+
+cd "$ORIG_DIR"
+
+# --project must be rejected when multiple specs exist
+PROJ1B="$TMPDIR_TEST/proj1b"
+make_tasks_md "$PROJ1B" "001-auth"
+make_tasks_md "$PROJ1B" "002-api"
+cd "$PROJ1B"
+assert_exit "create --project rejected with multiple specs" 1 "$BDIM" create --dry-run --project bad
+cd "$ORIG_DIR"
+
+# create with no specs/ directory at all
+PROJ_EMPTY="$TMPDIR_TEST/proj-empty"
+mkdir -p "$PROJ_EMPTY"
+cd "$PROJ_EMPTY"
+assert_exit "create exits 1 with no specs/ dir" 1 "$BDIM" create --dry-run
+cd "$ORIG_DIR"
+
+# -----------------------------------------------------------------------------
+section "create --dry-run: project ID derivation"
+# -----------------------------------------------------------------------------
+
+PROJ2="$TMPDIR_TEST/proj2"
+make_tasks_md "$PROJ2" "042-my-feature-name"
+cd "$PROJ2"
+assert_exit_contains "numeric prefix stripped"        0  "my-feature-name"  "$BDIM" create --dry-run
+cd "$ORIG_DIR"
+
+PROJ3="$TMPDIR_TEST/proj3"
+make_tasks_md "$PROJ3" "001-UPPER-CASE"
+cd "$PROJ3"
+assert_exit_contains "project ID lowercased"          0  "upper-case"       "$BDIM" create --dry-run
+cd "$ORIG_DIR"
+
+# -----------------------------------------------------------------------------
+section "create --dry-run: checkbox → status mapping"
+# -----------------------------------------------------------------------------
+
+PROJ4="$TMPDIR_TEST/proj4"
+mkdir -p "$PROJ4/specs/001-statuses"
+cat > "$PROJ4/specs/001-statuses/tasks.md" <<'EOF'
+- [ ] T001 Open task
+- [x] T002 Closed task
+EOF
+cd "$PROJ4"
+# Both tasks should be previewed regardless of checkbox state
+assert_exit_contains "open task appears in dry-run"   0  "T001"  "$BDIM" create --dry-run
+assert_exit_contains "closed task appears in dry-run" 0  "T002"  "$BDIM" create --dry-run
+cd "$ORIG_DIR"
+
+# -----------------------------------------------------------------------------
+section "init --dry-run"
+# -----------------------------------------------------------------------------
+
+INIT1="$TMPDIR_TEST/init1"
+mkdir -p "$INIT1"
+cd "$INIT1"
+git init -q
+
+assert_exit_contains "init --dry-run shows bd init"        0  "Would run: bd init"  "$BDIM" init --dry-run
+assert_exit_contains "init --dry-run shows gitignore add"  0  ".beads/dolt/"        "$BDIM" init --dry-run
+assert_exit           "init --dry-run is idempotent"       0                        "$BDIM" init --dry-run
+
+# With entries already in .gitignore — should report no changes needed
+printf '.beads/dolt/\n.beads/*.db\n' > .gitignore
+assert_exit_contains "init --dry-run skips existing entries" 0 "already contains" "$BDIM" init --dry-run
+
+cd "$ORIG_DIR"
+
+# Outside a git repo — init should still work (skips gitignore step)
+INIT2="$TMPDIR_TEST/init2"
+mkdir -p "$INIT2"
+cd "$INIT2"
+assert_exit "init --dry-run outside git repo exits 0" 0 "$BDIM" init --dry-run
+cd "$ORIG_DIR"
+
+# ── summary ───────────────────────────────────────────────────────────────────
+
+total=$(( PASS + FAIL ))
+printf '\n'
+if [[ $FAIL -eq 0 ]]; then
+  printf '%s  %d/%d passed\n' "$(_green '●')" "$PASS" "$total"
+  exit 0
+else
+  printf '%s  %d/%d passed, %d failed\n' "$(_red '●')" "$PASS" "$total" "$FAIL"
+  exit 1
+fi
