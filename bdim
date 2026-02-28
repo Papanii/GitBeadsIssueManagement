@@ -5,8 +5,9 @@
 # Requires : bash ≥ 3.2, jq, gh (GitHub CLI), bd (Beads CLI)
 # =============================================================================
 # SOURCE OF TRUTH MODEL
-#   Phase 1 — spec-kit is canonical.  Run: /speckit.tasks → generates tasks.md
-#              Then: bdim create  (auto-reads .specify/specs/*/tasks.md)
+#   Phase 1 — spec-kit is canonical.  Run the spec-kit workflow:
+#              /speckit.constitution → /speckit.specify → /speckit.plan → /speckit.tasks
+#              Then: bdim create  (auto-reads specs/*/tasks.md)
 #   Phase 2 — Beads are canonical.   Run: bdim convert / bdim sync
 #   GitHub Issues are read-only projections of Beads.
 #   GitHub edits do NOT flow back into Beads unless --force is used.
@@ -697,7 +698,7 @@ cmd_create() {
 
   if [[ ${#tasks_files[@]} -eq 0 ]]; then
     die "No tasks.md files found under specs/." \
-        $'\n       ''Run /speckit.tasks to generate a tasks.md first.'
+        $'\n       ''Run the spec-kit workflow (/speckit.constitution → .specify → .plan → .tasks) first.'
   fi
 
   # --project only makes sense when there is exactly one file
@@ -1677,7 +1678,7 @@ ${BOLD}EXAMPLES${RESET}
   # First-time project setup:
   ./bdim init
 
-  # Phase 1 — run /speckit.tasks to generate specs/*/tasks.md, then:
+  # Phase 1 — run the spec-kit workflow to generate specs/*/tasks.md, then:
   ./bdim create
   ./bdim create --dry-run
   ./bdim create --project myproject   # single spec only
@@ -1697,13 +1698,14 @@ ${BOLD}EXAMPLES${RESET}
 
 ${BOLD}SOURCE OF TRUTH MODEL${RESET}
 
-  1. spec-kit /speckit.tasks generates specs/*/tasks.md
+  1. spec-kit workflow (/speckit.constitution → .specify → .plan → .tasks)
+     generates specs/*/tasks.md
   2. bdim create reads those files and creates Beads in bd.
   3. After Beads exist in bd, Beads are the source of truth.
   4. GitHub Issues are read-only projections of Beads.
   5. GitHub edits do NOT override Beads (unless --force is used).
   6. Changes flow:
-       Phase 1:  /speckit.tasks → tasks.md → bdim create → bd
+       Phase 1:  spec-kit workflow → tasks.md → bdim create → bd
        Phase 2:  bd Beads → bdim sync → GitHub Issues
 
 EOF
