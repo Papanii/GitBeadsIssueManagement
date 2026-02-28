@@ -75,8 +75,8 @@ bd init
 ## Installation
 
 ```bash
-git clone https://github.com/Papanii/beadsync.git
-cd beadsync
+git clone https://github.com/Papanii/GitBeadsIssueManagement.git
+cd GitBeadsIssueManagement
 
 # Install globally (no sudo needed)
 mkdir -p ~/.local/bin
