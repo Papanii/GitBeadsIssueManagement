@@ -1426,10 +1426,16 @@ cmd_init() {
   fi
 
   printf '\n'
-  log_info "Setup complete. Next steps:"
-  log_info "  1. Run /speckit.tasks in your spec-kit project to generate tasks.md"
-  log_info "  2. bdim speckit-to-beads"
-  log_info "  3. bdim sync --repo owner/my-project"
+  log_info "Setup complete. Next steps (run these slash commands in your AI agent):"
+  log_info "  1. /speckit.constitution   — establish project principles"
+  log_info "  2. /speckit.specify        — define feature requirements & user stories"
+  log_info "  3. /speckit.clarify        — (optional) resolve ambiguities in the spec"
+  log_info "  4. /speckit.plan           — create technical implementation plan"
+  log_info "  5. /speckit.tasks          — generate tasks.md from the plan"
+  log_info ""
+  log_info "Then import into Beads and sync to GitHub:"
+  log_info "  6. bdim create                     — import tasks.md into bd"
+  log_info "  7. bdim sync --repo owner/my-project  — push Beads to GitHub Issues"
 }
 
 # =============================================================================
