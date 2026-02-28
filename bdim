@@ -6,8 +6,8 @@
 # =============================================================================
 # SOURCE OF TRUTH MODEL
 #   Phase 1 — spec-kit is canonical.  Run: /speckit.tasks → generates tasks.md
-#              Then: bdim speckit-to-beads  (auto-reads .specify/specs/*/tasks.md)
-#   Phase 2 — Beads are canonical.   Run: beads-to-gh / sync
+#              Then: bdim create  (auto-reads .specify/specs/*/tasks.md)
+#   Phase 2 — Beads are canonical.   Run: bdim convert / bdim sync
 #   GitHub Issues are read-only projections of Beads.
 #   GitHub edits do NOT flow back into Beads unless --force is used.
 # =============================================================================
@@ -135,66 +135,6 @@ _sha256() { command -v sha256sum &>/dev/null && sha256sum | awk '{print $1}' \
 sha256_of() { printf '%s' "$1" | _sha256; }
 
 iso8601_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
-require_file() { [[ -f "$1" ]] || die "File not found: $1"; }
-
-validate_json_file() {
-  jq empty "$1" 2>/dev/null || die "Invalid JSON in file: $1"
-}
-
-# =============================================================================
-# FIELD MAPPING: Speckit → Bead
-# =============================================================================
-
-# Portable lowercase (works with bash 3.2 shipped on macOS)
-lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-
-# Speckit priority string → Bead integer (P0–P4)
-map_priority() {
-  case "$(lc "$1")" in
-    critical|p0|0)          echo 0 ;;
-    high|p1|1)              echo 1 ;;
-    medium|normal|p2|2)     echo 2 ;;
-    low|p3|3)               echo 3 ;;
-    none|trivial|p4|4|*)    echo 4 ;;
-  esac
-}
-
-# Speckit status string → Bead status enum
-map_status() {
-  case "$(lc "$1")" in
-    pending|todo|backlog|open|new|not_started)           echo "open" ;;
-    in_progress|in-progress|active|started|wip|doing)   echo "in_progress" ;;
-    done|complete|completed|closed|resolved|finished)   echo "closed" ;;
-    blocked|on_hold|on-hold|waiting)                    echo "blocked" ;;
-    deferred|postponed|later|icebox)                    echo "deferred" ;;
-    cancelled|canceled|wontfix|wont_fix|abandoned)      echo "closed" ;;
-    *)                                                  echo "open" ;;
-  esac
-}
-
-# Map status string to Bead close_reason when applicable
-map_close_reason() {
-  case "$(lc "$1")" in
-    cancelled|canceled|wontfix|wont_fix)   echo "wontfix" ;;
-    abandoned)                              echo "abandoned" ;;
-    done|complete|completed|resolved)       echo "completed" ;;
-    *)                                      echo "" ;;
-  esac
-}
-
-# Speckit type string → Bead issue_type enum
-map_type() {
-  case "$(lc "$1")" in
-    task|tasks|work)                       echo "task" ;;
-    bug|defect|issue|error)               echo "bug" ;;
-    feature|enhancement|feat|story|us)    echo "feature" ;;
-    epic|theme|initiative|program)        echo "epic" ;;
-    chore|maintenance|infra|tech_debt|dx) echo "chore" ;;
-    decision|adr|dec|rfc)                 echo "decision" ;;
-    *)                                    echo "task" ;;
-  esac
-}
 
 # spec-kit user story number → Bead priority (US1=P1/high … none=P2/medium)
 map_us_priority() {
@@ -533,7 +473,7 @@ _S2B_CREATED=0
 _S2B_UPDATED=0
 _S2B_FAILED=0
 
-cmd_speckit_to_beads() {
+cmd_create() {
   local project_id_flag=""
 
   while [[ $# -gt 0 ]]; do
@@ -542,7 +482,7 @@ cmd_speckit_to_beads() {
       --dry-run)      DRY_RUN=true;         shift ;;
       --verbose|-v)   VERBOSE=true;         shift ;;
       -*)             die "Unknown option: $1" ;;
-      *)              die_usage "speckit-to-beads takes no positional arguments — tasks.md files are auto-discovered under specs/" ;;
+      *)              die_usage "create takes no positional arguments — tasks.md files are auto-discovered under specs/" ;;
     esac
   done
 
@@ -582,7 +522,7 @@ cmd_speckit_to_beads() {
   done
 
   printf '\n'
-  log_info "speckit-to-beads complete — created: $_S2B_CREATED, updated: $_S2B_UPDATED, failed: $_S2B_FAILED"
+  log_info "create complete — created: $_S2B_CREATED, updated: $_S2B_UPDATED, failed: $_S2B_FAILED"
   [[ "$DRY_RUN" == true ]] && log_warn "Dry-run — no beads were created or updated."
 
   [[ $(( _S2B_CREATED + _S2B_UPDATED )) -gt 0 ]] && bd_export_jsonl
@@ -968,7 +908,7 @@ _run_gh_sync() {
       log_warn "bd database is empty but .beads/issues.jsonl exists."
       log_warn "Run: bd import -i .beads/issues.jsonl  then retry."
     else
-      log_warn "No beads found.  Run: bdim speckit-to-beads first."
+      log_warn "No beads found.  Run: bdim create first."
     fi
     return 0
   fi
@@ -1014,47 +954,28 @@ _run_gh_sync() {
   [[ $failed -eq 0 ]] || { log_error "$failed bead(s) failed to sync"; return 1; }
 }
 
-cmd_beads_to_gh() {
+cmd_convert() {
   local repo=""
   local force_update=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --repo|-r)    repo="$2";        shift 2 ;;
+      --repo|-r)    repo="$2";         shift 2 ;;
       --force)      force_update=true; shift ;;
       --dry-run)    DRY_RUN=true;      shift ;;
       --all-beads)  ALL_BEADS=true;    shift ;;
       --verbose|-v) VERBOSE=true;      shift ;;
       -*)           die "Unknown option: $1" ;;
-      *)            die "Unexpected argument '$1'.  Note: a beads directory is no longer required — beads are read directly from bd." ;;
+      *)            die "Unexpected argument: $1" ;;
     esac
   done
 
-  [[ -n "$repo" ]] || die_usage "Usage: bdim beads-to-gh --repo owner/name"
+  [[ -n "$repo" ]] || die_usage "Usage: bdim convert --repo owner/name"
 
   _run_gh_sync "$repo" "$force_update"
 }
 
-cmd_sync() {
-  local repo=""
-  local force_update=false
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --repo|-r)    repo="$2";        shift 2 ;;
-      --force)      force_update=true; shift ;;
-      --dry-run)    DRY_RUN=true;      shift ;;
-      --all-beads)  ALL_BEADS=true;    shift ;;
-      --verbose|-v) VERBOSE=true;      shift ;;
-      -*)           die "Unknown option: $1" ;;
-      *)            die "Unexpected argument '$1'.  Note: a beads directory is no longer required — beads are read directly from bd." ;;
-    esac
-  done
-
-  [[ -n "$repo" ]] || die_usage "Usage: bdim sync --repo owner/name"
-
-  _run_gh_sync "$repo" "$force_update"
-}
+cmd_sync() { cmd_convert "$@"; }
 
 # =============================================================================
 # STATUS REPORT
@@ -1085,7 +1006,7 @@ cmd_status() {
       log_warn "bd database is empty but .beads/issues.jsonl exists."
       log_warn "Run: bd import -i .beads/issues.jsonl  then try again."
     else
-      log_warn "No beads found.  Run: bdim speckit-to-beads first."
+      log_warn "No beads found.  Run: bdim create first."
     fi
     return 0
   fi
@@ -1231,32 +1152,31 @@ ${BOLD}COMMANDS${RESET}
       --dry-run        Preview without writing anything
       --verbose, -v    Verbose output
 
-  ${CYAN}speckit-to-beads${RESET}  [--project ID]
-    Read all tasks.md files under .specify/specs/*/tasks.md (auto-discovered)
-    and create or update Beads in the local bd database.
-    Each task line becomes a Bead tagged with label 'speckit'.
-    Project ID is derived from the spec folder name (e.g. 001-my-feature → my-feature).
-    Idempotent: re-running updates only changed tasks.
+  ${CYAN}create${RESET}  [--project ID]
+    Read all tasks.md files under specs/*/tasks.md (auto-discovered) and
+    create or update Beads in the local bd database.  Each task line becomes
+    a Bead tagged with label 'speckit'.  Idempotent — re-running only touches
+    tasks that have changed.
 
-      --project, -p ID Override the project ID used to namespace Bead external
-                       refs.  Only valid when a single tasks.md is found.
+      --project, -p ID Override the project namespace (only valid when one
+                       tasks.md is found)
       --dry-run        Preview without calling bd
       --verbose, -v    Verbose output
 
-  ${CYAN}beads-to-gh${RESET}  --repo owner/name
-    Push Beads (label=speckit) to GitHub Issues.  Creates new issues and updates
-    existing ones.  Manual GitHub edits are preserved unless --force.
+  ${CYAN}convert${RESET}  --repo owner/name
+    Push Beads (label=speckit) to GitHub Issues.  Creates new issues and
+    updates existing ones.  Manual GitHub edits are preserved unless --force.
 
       --repo, -r REPO  GitHub repo, e.g. acme/my-project  (required)
       --force          Override GitHub edits; always push Bead content
       --dry-run        Preview without touching GitHub
-      --all-beads      Sync all beads regardless of label (default: speckit-labelled only)
+      --all-beads      Include all beads, not just speckit-labelled ones
       --verbose, -v    Verbose output
 
   ${CYAN}sync${RESET}  --repo owner/name
-    Alias for beads-to-gh.  Only pushes Beads whose content has changed.
+    Alias for convert.  Only pushes Beads whose content has changed.
 
-      Same options as beads-to-gh.
+      Same options as convert.
 
   ${CYAN}status${RESET}
     Print a table of all Beads (label=speckit) and their GitHub sync state.
@@ -1291,7 +1211,7 @@ ${BOLD}TEAM WORKFLOW (multi-machine)${RESET}
   Workflow for each team member:
     git pull
     bd import -i .beads/issues.jsonl   ← rebuild local Dolt DB
-    bdim speckit-to-beads          ← creates/updates beads + auto-exports
+    bdim create                    ← creates/updates beads + auto-exports
     bdim sync --repo ...           ← pushes to GitHub   + auto-exports
     git add .beads/issues.jsonl && git commit && git push
 
@@ -1303,23 +1223,22 @@ ${BOLD}EXIT CODES${RESET}
 
 ${BOLD}EXAMPLES${RESET}
 
-  # First-time setup in a new project:
+  # First-time project setup:
   ./bdim init
 
-  # Phase 1 — run /speckit.tasks first to generate .specify/specs/*/tasks.md
-  # then import all tasks into bd:
-  ./bdim speckit-to-beads
-  ./bdim speckit-to-beads --dry-run
-  ./bdim speckit-to-beads --project myproject   # single spec only
+  # Phase 1 — run /speckit.tasks to generate specs/*/tasks.md, then:
+  ./bdim create
+  ./bdim create --dry-run
+  ./bdim create --project myproject   # single spec only
 
-  # Phase 2a — push all Beads to GitHub Issues (first time)
-  ./bdim beads-to-gh --repo acme/my-project --dry-run
-  ./bdim beads-to-gh --repo acme/my-project
+  # Phase 2 — push Beads to GitHub Issues
+  ./bdim convert --repo acme/my-project --dry-run
+  ./bdim convert --repo acme/my-project
 
-  # Phase 2b — sync changed Beads (idempotent, run as often as needed)
+  # Ongoing — sync only changed Beads (idempotent)
   ./bdim sync --repo acme/my-project
 
-  # Force-push all Beads (overrides any manual GitHub edits)
+  # Force-push all Beads (overrides manual GitHub edits)
   ./bdim sync --repo acme/my-project --force
 
   # Check sync state without touching anything
@@ -1327,13 +1246,13 @@ ${BOLD}EXAMPLES${RESET}
 
 ${BOLD}SOURCE OF TRUTH MODEL${RESET}
 
-  1. spec-kit /speckit.tasks generates .specify/specs/*/tasks.md
-  2. bdim speckit-to-beads reads those files and creates Beads in bd.
+  1. spec-kit /speckit.tasks generates specs/*/tasks.md
+  2. bdim create reads those files and creates Beads in bd.
   3. After Beads exist in bd, Beads are the source of truth.
   4. GitHub Issues are read-only projections of Beads.
   5. GitHub edits do NOT override Beads (unless --force is used).
   6. Changes flow:
-       Phase 1:  /speckit.tasks → tasks.md → bdim speckit-to-beads → bd
+       Phase 1:  /speckit.tasks → tasks.md → bdim create → bd
        Phase 2:  bd Beads → bdim sync → GitHub Issues
 
 EOF
@@ -1351,11 +1270,11 @@ main() {
   local cmd="$1"; shift
 
   case "$cmd" in
-    init)                   cmd_init "$@" ;;
-    speckit-to-beads|s2b)   cmd_speckit_to_beads "$@" ;;
-    beads-to-gh|b2g)        cmd_beads_to_gh "$@" ;;
-    sync)                   cmd_sync "$@" ;;
-    status|st)              cmd_status "$@" ;;
+    init)             cmd_init "$@" ;;
+    create)           cmd_create "$@" ;;
+    convert)          cmd_convert "$@" ;;
+    sync)             cmd_sync "$@" ;;
+    status|st)        cmd_status "$@" ;;
     version|--version|-V)   printf 'bdim v%s\n' "$VERSION"; exit 0 ;;
     help|--help|-h)         show_usage; exit 0 ;;
     *)
