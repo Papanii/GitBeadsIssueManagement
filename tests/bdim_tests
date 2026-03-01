@@ -330,6 +330,55 @@ cd "$INIT2"
 assert_exit "init --dry-run outside git repo exits 0" 0 "$BDIM" init --dry-run
 cd "$ORIG_DIR"
 
+# -----------------------------------------------------------------------------
+section "create --dry-run: scaffolding task injection"
+# -----------------------------------------------------------------------------
+
+# First run (no T000 in file) — should report injection and process T000
+PROJ_SCAF1="$TMPDIR_TEST/proj-scaf1"
+make_tasks_md "$PROJ_SCAF1" "001-feature"
+cd "$PROJ_SCAF1"
+assert_exit_contains  "first-run dry-run reports T000 injection"  0  "First run detected"  "$BDIM" create --dry-run
+assert_exit_contains  "first-run dry-run processes T000 bead"     0  "T000"                "$BDIM" create --dry-run
+assert_exit_contains  "first-run dry-run shows scaffolding title" 0  "scaffolding"         "$BDIM" create --dry-run
+# Original tasks still processed alongside T000
+assert_exit_contains  "first-run dry-run still has T001"          0  "T001"                "$BDIM" create --dry-run
+cd "$ORIG_DIR"
+
+# T000 already present — should NOT report first-run injection
+PROJ_SCAF2="$TMPDIR_TEST/proj-scaf2"
+mkdir -p "$PROJ_SCAF2/specs/001-feature"
+cat > "$PROJ_SCAF2/specs/001-feature/tasks.md" <<'SCAF_EOF'
+## Phase 1 — Foundation
+
+- [ ] T000 Commit project scaffolding (AGENTS.md, specs/, .beads/issues.jsonl)
+- [ ] T001 Create project structure per implementation plan
+SCAF_EOF
+cd "$PROJ_SCAF2"
+out=$(_output_of "$BDIM" create --dry-run)
+if printf '%s' "$out" | grep -qE "First run detected"; then
+  fail "T000 present triggers injection (should not)"
+else
+  pass "T000 present skips injection"
+fi
+assert_exit_contains  "T000 present still processes T000"         0  "T000"                "$BDIM" create --dry-run
+cd "$ORIG_DIR"
+
+# Multiple specs — T000 injected into each
+PROJ_SCAF3="$TMPDIR_TEST/proj-scaf3"
+make_tasks_md "$PROJ_SCAF3" "001-auth"
+make_tasks_md "$PROJ_SCAF3" "002-api"
+cd "$PROJ_SCAF3"
+out=$(_output_of "$BDIM" create --dry-run)
+# Should see T000 from both specs
+t000_count=$(printf '%s' "$out" | grep -c "T000" || true)
+if [[ "$t000_count" -ge 2 ]]; then
+  pass "multi-spec: T000 appears in both specs"
+else
+  fail "multi-spec: T000 appears in both specs  (count: $t000_count)"
+fi
+cd "$ORIG_DIR"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 
 total=$(( PASS + FAIL ))

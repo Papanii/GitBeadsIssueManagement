@@ -95,9 +95,11 @@ bdim init
 /speckit.tasks               # generate tasks.md from the plan
 
 # 3. Import tasks into your local bd database
+#    (on first run, bdim auto-injects a T000 scaffolding task)
 bdim create
 
 # 4. Push to GitHub Issues
+#    (scaffolding files are auto-committed and the T000 issue is closed)
 bdim sync --repo owner/my-project
 ```
 
@@ -138,6 +140,8 @@ Auto-discovers all `tasks.md` files under `specs/*/tasks.md` in the current dire
 
 Each task line becomes one Bead tagged with the `speckit` label. `[US\d+]` markers automatically create an **epic** Bead for each unique user story — child tasks are linked underneath it. Project ID is derived automatically from the spec folder name (`001-my-feature` → `my-feature`). Fully idempotent — re-running only touches tasks that have changed.
 
+**Scaffolding task (T000):** On the very first run, `bdim create` automatically injects a `T000` scaffolding task into each `tasks.md`. This task tracks the initial commit of project artifacts (`AGENTS.md`, `specs/`, `.beads/issues.jsonl`). It flows through the normal pipeline and is auto-closed by `bdim migrate` after the files are committed and pushed.
+
 | Option | Default | Description |
 |---|---|---|
 | `--project, -p ID` | folder name | Override the project namespace (only valid when one `tasks.md` is found) |
@@ -168,6 +172,8 @@ bdim migrate --repo owner/name [options]
 Reads Beads from the local `bd` database and pushes them to GitHub Issues. By default only Beads tagged `speckit` are included; pass `--all-beads` to sync every Bead regardless of label. Creates new issues for unsynced Beads and updates existing ones when content has changed. Manual edits to GitHub issues are preserved unless `--force` is used.
 
 Epic Beads are synced last so child issues already have issue numbers, producing a native GitHub progress-bar task list in the epic issue body.
+
+**Scaffolding auto-commit:** After syncing all issues, if a T000 scaffolding bead exists with uncommitted project files (`AGENTS.md`, `specs/`, `.beads/issues.jsonl`), `migrate` automatically commits, pushes, and closes the scaffolding GitHub issue.
 
 | Option | Default | Description |
 |---|---|---|
@@ -370,6 +376,7 @@ bdim init                                # first time only — sets up spec-kit 
 bdim create --dry-run
 
 # Import tasks as Beads (also creates epic Beads for [US\d+] groups)
+# First run auto-injects T000 scaffolding task into tasks.md
 bdim create
 
 # Check the current sync state
@@ -381,6 +388,7 @@ bdim status
 bdim migrate --repo acme/my-project --dry-run
 
 # Push to GitHub (epics get parent issues with child task lists)
+# T000 scaffolding files are auto-committed, pushed, and the issue is closed
 bdim migrate --repo acme/my-project
 
 # Run sync a second time to populate #N links in epic task lists

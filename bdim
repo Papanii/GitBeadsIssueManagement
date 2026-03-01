@@ -35,6 +35,13 @@ DRY_RUN=false
 VERBOSE=false
 ALL_BEADS=false
 
+# ---------------------------------------------------------------------------
+# Scaffolding task constants
+# ---------------------------------------------------------------------------
+SCAFFOLDING_TASK_ID="T000"
+SCAFFOLDING_TASK_LINE="- [ ] T000 Commit project scaffolding (AGENTS.md, specs/, .beads/issues.jsonl)"
+SCAFFOLDING_COMMIT_MSG="Project scaffolding — commit spec-kit and Beads artifacts"
+
 # =============================================================================
 # LOGGING
 # =============================================================================
@@ -417,6 +424,79 @@ _ensure_epic_bead() {
   _EPIC_BEAD_ACTION="created"
 }
 
+# =============================================================================
+# SCAFFOLDING TASK INJECTION
+# =============================================================================
+
+# Regex to match a checklist task line: - [ ] T001 ... or - [x] T002 ...
+# Stored in a variable because the bracket expression confuses [[ =~ ]] parsing.
+_TASK_LINE_RE='^[[:space:]]*-[[:space:]]\[[ x]\][[:space:]]+T[0-9]+'
+
+# Returns 0 (true) if no speckit-labelled beads exist in bd.
+# In dry-run mode, checks whether T000 line already exists in any tasks.md.
+_is_first_run() {
+  if [[ "$DRY_RUN" == true ]]; then
+    local f
+    for f in "$@"; do
+      grep -qE '^\s*-\s*\[[ x]\]\s+T000\b' "$f" && return 1
+    done
+    return 0
+  fi
+  local count
+  count=$(bd list --all --limit 1 -l speckit --json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+  [[ "$count" == "0" ]]
+}
+
+# Prepend the T000 scaffolding task line to a tasks.md file on disk.
+# Inserts before the first checklist item.  Idempotent — skips if T000 exists.
+_inject_scaffolding_task() {
+  local tasks_file="$1"
+
+  # Idempotency: skip if T000 already exists
+  if grep -qE '^\s*-\s*\[[ x]\]\s+T000\b' "$tasks_file"; then
+    log_debug "T000 already present in $tasks_file — skipping injection"
+    return 0
+  fi
+
+  local tmp_file="${tasks_file}.bdim-tmp"
+  local injected=false
+  while IFS= read -r line; do
+    if [[ "$injected" == false ]] && [[ "$line" =~ $_TASK_LINE_RE ]]; then
+      printf '%s\n' "$SCAFFOLDING_TASK_LINE"
+      injected=true
+    fi
+    printf '%s\n' "$line"
+  done < "$tasks_file" > "$tmp_file"
+
+  # If no task lines found, append at end
+  if [[ "$injected" == false ]]; then
+    printf '%s\n' "$SCAFFOLDING_TASK_LINE" >> "$tmp_file"
+  fi
+
+  mv "$tmp_file" "$tasks_file"
+  log_info "Injected T000 scaffolding task into $tasks_file"
+}
+
+# Output tasks.md content with T000 prepended (pure stream — for dry-run temp files).
+_inject_scaffolding_task_to_stream() {
+  local tasks_file="$1"
+  local injected=false
+  while IFS= read -r line; do
+    if [[ "$injected" == false ]] && [[ "$line" =~ $_TASK_LINE_RE ]]; then
+      printf '%s\n' "$SCAFFOLDING_TASK_LINE"
+      injected=true
+    fi
+    printf '%s\n' "$line"
+  done < "$tasks_file"
+  if [[ "$injected" == false ]]; then
+    printf '%s\n' "$SCAFFOLDING_TASK_LINE"
+  fi
+}
+
+# =============================================================================
+# TASKS.MD → BEADS PROCESSOR
+# =============================================================================
+
 _process_tasks_file() {
   local tasks_file="$1"
   local project_id="$2"
@@ -553,6 +633,11 @@ _process_tasks_file() {
         parent_external_ref: (if $pref != "" then $pref else null end),
         parallel:            $p
       } | with_entries(select(.value != null))')
+
+    # Mark T000 as the scaffolding task
+    if [[ "$task_id" == "$SCAFFOLDING_TASK_ID" ]]; then
+      base_meta_json=$(printf '%s' "$base_meta_json" | jq -c '. + {is_scaffolding: true}')
+    fi
 
     # ========================================================================
     # CREATE — no existing bead found
@@ -711,6 +796,18 @@ cmd_create() {
 
   _S2B_CREATED=0; _S2B_UPDATED=0; _S2B_FAILED=0; _S2B_EPICS=0
 
+  # ── First-run scaffolding injection ──────────────────────────────────────
+  local _scaffolding_injected=false
+  if _is_first_run "${tasks_files[@]}"; then
+    log_info "First run detected — injecting T000 scaffolding task"
+    _scaffolding_injected=true
+    if [[ "$DRY_RUN" != true ]]; then
+      for f in "${tasks_files[@]}"; do
+        _inject_scaffolding_task "$f"
+      done
+    fi
+  fi
+
   local f project_id
   for f in "${tasks_files[@]}"; do
     if [[ -n "$project_id_flag" ]]; then
@@ -718,7 +815,17 @@ cmd_create() {
     else
       project_id=$(_project_id_from_folder "$(dirname "$f")")
     fi
-    _process_tasks_file "$f" "$project_id"
+
+    local process_file="$f"
+    if [[ "$_scaffolding_injected" == true && "$DRY_RUN" == true ]]; then
+      # Create a temp copy with T000 prepended for dry-run processing
+      process_file=$(mktemp)
+      _inject_scaffolding_task_to_stream "$f" > "$process_file"
+    fi
+
+    _process_tasks_file "$process_file" "$project_id"
+
+    [[ "$process_file" != "$f" ]] && rm -f "$process_file"
   done
 
   printf '\n'
@@ -1139,6 +1246,104 @@ _sync_one_bead() {
   _BEAD_SYNC_RESULT="updated"
 }
 
+# After all issues are synced, check for a scaffolding bead and commit
+# the referenced project files if they haven't been committed yet.
+_handle_scaffolding_commit() {
+  local repo="$1"
+
+  # Must be in a git repo
+  git rev-parse --git-dir &>/dev/null 2>&1 || return 0
+
+  # Re-fetch beads (metadata was updated during sync with issue numbers)
+  local all_beads
+  all_beads=$(bd list --all --limit 0 -l speckit --json 2>/dev/null || true)
+  [[ -z "$all_beads" || "$all_beads" == "[]" ]] && return 0
+
+  # Find the scaffolding bead by metadata marker
+  local scaffolding_id
+  scaffolding_id=$(printf '%s' "$all_beads" | jq -r \
+    '[.[]? | select(.metadata.is_scaffolding == true)] | .[0].id // empty' 2>/dev/null)
+  [[ -z "$scaffolding_id" ]] && return 0
+
+  # Get full bead details
+  local scaffolding_bead
+  scaffolding_bead=$(bd_get_bead_json "$scaffolding_id")
+  [[ -z "$scaffolding_bead" ]] && return 0
+
+  local gh_number bead_status
+  gh_number=$(printf '%s' "$scaffolding_bead" | jq -r '.metadata.github_issue_number // empty')
+  bead_status=$(printf '%s' "$scaffolding_bead" | jq -r '.status // "open"')
+
+  # Skip if already closed (idempotency)
+  [[ "$bead_status" == "closed" ]] && return 0
+
+  # Skip if no GitHub issue number yet
+  [[ -z "$gh_number" ]] && return 0
+
+  # Check if any target files need committing
+  local needs_commit=false
+  local files_to_add=()
+
+  [[ -f "AGENTS.md" ]] && files_to_add+=("AGENTS.md")
+  [[ -d "specs" ]]     && files_to_add+=("specs/")
+  [[ -f ".beads/issues.jsonl" ]] && files_to_add+=(".beads/issues.jsonl")
+
+  for f in "${files_to_add[@]}"; do
+    if [[ -n "$(git status --porcelain "$f" 2>/dev/null)" ]]; then
+      needs_commit=true
+      break
+    fi
+  done
+
+  if [[ "$needs_commit" == false ]]; then
+    log_debug "Scaffolding files already committed — skipping"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log_dry "Would git add: ${files_to_add[*]}"
+    log_dry "Would git commit -m \"$SCAFFOLDING_COMMIT_MSG\""
+    log_dry "Would git push"
+    log_dry "Would close GitHub issue #$gh_number"
+    log_dry "Would close bead $scaffolding_id"
+    return 0
+  fi
+
+  log_info "Scaffolding commit: staging project artifacts..."
+
+  git add "${files_to_add[@]}" \
+    || { log_warn "git add failed for scaffolding"; return 0; }
+
+  if ! git commit -m "$SCAFFOLDING_COMMIT_MSG"; then
+    log_warn "git commit failed for scaffolding (maybe nothing to commit)"
+    return 0
+  fi
+
+  if ! git push; then
+    log_warn "git push failed for scaffolding — try bdim latest first"
+    return 0
+  fi
+
+  log_info "Scaffolding commit pushed."
+
+  # Close the GitHub issue
+  if gh issue close "$gh_number" --repo "$repo" &>/dev/null; then
+    log_info "Closed scaffolding issue #$gh_number"
+  else
+    log_warn "Could not close scaffolding issue #$gh_number"
+  fi
+
+  # Update bead status to closed
+  if bd update "$scaffolding_id" -s "closed" -q 2>/dev/null; then
+    log_info "Closed scaffolding bead $scaffolding_id"
+  else
+    log_warn "Could not close scaffolding bead $scaffolding_id"
+  fi
+
+  # Re-export JSONL to capture the status change
+  bd_export_jsonl
+}
+
 _run_gh_sync() {
   local repo="$1"
   local force_update="$2"
@@ -1236,6 +1441,9 @@ _run_gh_sync() {
 
   # Keep .beads/issues.jsonl current (captures github_issue_* metadata write-backs)
   [[ $(( created + updated )) -gt 0 ]] && bd_export_jsonl
+
+  # Handle scaffolding task auto-commit (after all issues synced)
+  _handle_scaffolding_commit "$repo"
 
   [[ $failed -eq 0 ]] || { log_error "$failed bead(s) failed to sync"; return 1; }
 }
