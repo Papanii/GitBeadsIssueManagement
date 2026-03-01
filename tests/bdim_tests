@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-BDIM="$(cd "$(dirname "$0")/.." && pwd)/bdim"
+BDIM="$(cd "$(dirname "$0")/.." && pwd)/bin/bdim"
 ORIG_DIR="$PWD"
 TMPDIR_TEST=$(mktemp -d)
 PASS=0

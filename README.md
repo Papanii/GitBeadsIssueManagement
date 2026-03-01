@@ -65,14 +65,9 @@ You also need [spec-kit](https://github.com/github/spec-kit) installed so that `
 
 ```bash
 git clone https://github.com/Papanii/GitBeadsIssueManagement.git
-cd GitBeadsIssueManagement
 
-# Install globally (no sudo needed)
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bdim" ~/.local/bin/bdim
-
-# Add to PATH if not already (add to ~/.zshrc or ~/.bashrc)
-export PATH="$HOME/.local/bin:$PATH"
+# Add to PATH (add to ~/.zshrc or ~/.bashrc)
+export PATH="$HOME/Development/GitBeadsIssueManagement/bin:$PATH"
 source ~/.zshrc
 ```
 
@@ -464,7 +459,8 @@ On `sync`, this anchor is used to find the matching issue so it is updated rathe
 ## Project structure
 
 ```
-bdim                       ← the CLI script (single file, v3.2.0)
+bin/
+  bdim                     ← the CLI script (single file, v3.2.0)
 tests/
   bdim_tests               ← test suite (no bd/gh required)
 examples/
